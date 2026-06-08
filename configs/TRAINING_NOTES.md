@@ -227,21 +227,25 @@ the value above.
 ### All four released model families
 
 The other three families reused the Qwen recipe with light per-model adjustment
-(no per-model sweep). Ground truth is each released checkpoint's `nla_meta.yaml`
-`training:` block; summarized here. GRPO group size 8 and the 150-token response
-cap apply everywhere; LRs ran at actor/critic parity.
+(no per-model sweep). The standard setup throughout was **128 prompts × G=8 =
+1024 samples per rollout** (the paper's "batch size of 128" is prompts; multiply
+by the group size). The 150-token response cap applies everywhere; LRs ran at
+actor/critic parity.
 
-| | backend | RL global batch | RL lr (AV = AR) |
+| | backend | RL lr (AV = AR) | sidecar `global_batch_size`‡ |
 |---|---|---|---|
-| Qwen2.5-7B (L20) | FSDP | 1024 | 1.41e-5† |
-| Gemma-3-12B (L32) | FSDP | 1024 | 1e-5 |
-| Gemma-3-27B (L41) | FSDP | 2048 | 1.41e-5 |
-| Llama-3.3-70B (L53) | Megatron | 4096 | 5e-6 |
+| Qwen2.5-7B (L20) | FSDP | 1.41e-5† | 1024 |
+| Gemma-3-12B (L32) | FSDP | 1e-5 | 1024 |
+| Gemma-3-27B (L41) | FSDP | 1.41e-5 | 2048 |
+| Llama-3.3-70B (L53) | Megatron | 5e-6 | 4096 |
 
 † see footnote above re: the Qwen AR sidecar recording 7.07e-5 at save time.
 
-Note the paper appendix's single "batch size of 128, lr 10⁻⁵" describes the
-Qwen/12B-scale runs; 27B and 70B used the larger batches and adjusted LRs above.
+‡ The raw `--global-batch-size` arg recorded at save time. For Qwen/12B this
+equals the actual 1024 samples per rollout. Treat the larger 27B/70B entries
+with caution: 1024 samples per rollout (128 × 8) was the typical configuration,
+and the 70B run did not use 4096-sample (512-prompt) steps — the recorded arg
+does not necessarily equal samples per optimizer step.
 
 **Tuning headroom**: throughput knobs (micro-batch size, attention implementation,
 dynamic batching) were not profiled carefully and are not optimised for any particular
