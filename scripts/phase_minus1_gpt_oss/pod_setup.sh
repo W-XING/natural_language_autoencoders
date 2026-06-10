@@ -26,8 +26,11 @@ source /workspace/venv/bin/activate
 
 # sglang first — it pins torch/transformers to its tested versions (expected,
 # per docs/setup.md). kernels/accelerate: MXFP4 load path on Hopper.
+# kernels==0.9.0: newer kernels (0.10–0.15) crash at import against
+# huggingface_hub<1.0 (StrictDataclassFieldValidationError on `str | None`),
+# and transformers 4.57 requires hub<1.0 — 0.9.0 is the latest that imports.
 uv pip install "sglang[all]>=0.5.6"
-uv pip install accelerate kernels
+uv pip install accelerate "kernels==0.9.0"
 uv pip install -e "$NLA_REPO"
 
 # miles checkout at the pin + integration patches — PYTHONPATH import only.

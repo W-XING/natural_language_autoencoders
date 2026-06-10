@@ -9,7 +9,7 @@
 # Pass SKIP_SGLANG=1 to defer it.
 #
 # Usage: bash scripts/phase_minus1_gpt_oss/run_all.sh [logdir]
-set -u
+set -u -o pipefail  # without pipefail, `| tee` masks the python exit code → false PASS
 LOGDIR="${1:-/data/logs}"
 mkdir -p "$LOGDIR"
 cd "$(dirname "$0")/../.."
