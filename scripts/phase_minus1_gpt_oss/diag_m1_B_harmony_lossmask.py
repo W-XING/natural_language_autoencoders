@@ -47,7 +47,19 @@ def main() -> None:
 
     # --- 1+2. miles loss-mask generator on the generic path
     try:
-        from miles.utils.mask_utils import MultiTurnLossMaskGenerator
+        try:
+            from miles.utils.mask_utils import MultiTurnLossMaskGenerator
+        except ImportError:
+            # miles/__init__ pulls the full training stack (ray etc.) which the
+            # Phase −1 pod doesn't install — load mask_utils.py by file path.
+            import importlib.util
+            import os
+            path = os.environ.get("MILES_MASK_UTILS",
+                                  "/workspace/miles/miles/utils/mask_utils.py")
+            spec = importlib.util.spec_from_file_location("_mask_utils", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            MultiTurnLossMaskGenerator = mod.MultiTurnLossMaskGenerator
         gen = MultiTurnLossMaskGenerator(tok, tokenizer_type="generic")
         close_ids = gen._turn_close_ids()
         decoded = [tok.decode([i]) for i in close_ids]
