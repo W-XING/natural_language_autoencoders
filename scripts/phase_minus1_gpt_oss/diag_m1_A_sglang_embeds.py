@@ -49,6 +49,8 @@ def main() -> None:
     ap.add_argument("--model", default="openai/gpt-oss-20b")
     ap.add_argument("--url", default="http://127.0.0.1:30000")
     ap.add_argument("--max-new-tokens", type=int, default=32)
+    ap.add_argument("--inj-scale", type=float, default=5500.0,
+                    help="L2 norm for the perturbation row (phase0 p50–p90 of layer-17 norms)")
     ap.add_argument("--out", default="/data/logs/diag_m1_A.json")
     args = ap.parse_args()
 
@@ -64,24 +66,29 @@ def main() -> None:
     with safe_open(shard_path, framework="pt", device="cpu") as f:
         embed_w = f.get_tensor(key)  # [vocab, d] bf16
 
-    msgs = [{"role": "user", "content": "Briefly describe the following concept: <concept>X</concept>"}]
-    prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    input_ids = tok.encode(prompt, add_special_tokens=False)
+    # Use the REAL actor prompt + injection marker (㎡, single-token by
+    # construction — verified by −1.D). A literal content char like "X" BPE-
+    # merges with <concept> under Harmony and can't be found by token ID.
+    from nla.datagen.stage3_build import _DEFAULT_ACTOR_TEMPLATE
+    content = _DEFAULT_ACTOR_TEMPLATE.format(injection_char="㎡")
+    input_ids = tok.apply_chat_template([{"role": "user", "content": content}],
+                                        tokenize=True, add_generation_prompt=True)
     with torch.no_grad():
         base = embed_w[torch.tensor(input_ids, dtype=torch.long)].float().unsqueeze(0)  # [1, T, d]
 
-    # Perturb ONE mid-sequence position (the 'X' inside <concept>) by replacing
-    # its row with a large-norm random vector — same scale class as injection.
-    x_id = tok.encode("X", add_special_tokens=False)
-    pos_candidates = [i for i, t in enumerate(input_ids) if t in x_id and i > 5]
-    assert pos_candidates, f"couldn't find perturbation position; ids={input_ids[:50]}…"
-    pos = pos_candidates[-1]
-    row_norm = base[0, pos].norm().item()
+    inj_id = 83806  # committed injection_token_cache.yaml entry for gpt-oss
+    pos_candidates = [i for i, t in enumerate(input_ids) if t == inj_id]
+    assert len(pos_candidates) == 1, (
+        f"marker {inj_id} appears {len(pos_candidates)}× (expected 1); ids={input_ids[:50]}…")
+    pos = pos_candidates[0]
+    # Replace the marker row with a random vector at realistic injection scale
+    # (phase0: layer-17 extracted-position norms p50–p90 ≈ 5447–5901).
     g = torch.Generator().manual_seed(42)
+    v = torch.randn(base.shape[-1], generator=g)
     perturbed = base.clone()
-    perturbed[0, pos] = torch.randn(base.shape[-1], generator=g) * (row_norm * 10 / base.shape[-1] ** 0.5)
+    perturbed[0, pos] = v * (args.inj_scale / v.norm())
     print(f"T={len(input_ids)} d={base.shape[-1]} perturbed pos={pos} "
-          f"(row_norm {row_norm:.2f} → {perturbed[0, pos].norm().item():.2f})")
+          f"(row_norm {base[0, pos].norm().item():.2f} → {perturbed[0, pos].norm().item():.2f})")
 
     result: dict = {"pos": pos, "n_tokens": len(input_ids)}
     try:
