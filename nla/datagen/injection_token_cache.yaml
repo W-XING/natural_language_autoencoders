@@ -8,3 +8,6 @@
 meta-llama/Llama-3.3-70B-Instruct:
   char: "㎡"
   token_id: 105565
+openai/gpt-oss-20b:
+  char: "㎡"
+  token_id: 83806

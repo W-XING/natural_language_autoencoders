@@ -6,11 +6,16 @@
   `pyarrow`, `transformers`, `datasets`, `httpx`, `pyyaml`, `numpy`, `orjson`,
   `safetensors`, the public `anthropic` SDK, and whatever Miles/SGLang pull in.
   No private/internal dependencies.
-- **Miles is upstream, not ours.** Don't edit files under `miles/` — extend via
-  subclassing (`NLAFSDPActor`) and the `--*-path` function-pointer args. The
-  two upstream patches we depend on (`--custom-actor-cls-path`,
-  `--force-use-critic`) are documented in `docs/design.md` §2.
+- **Miles is upstream, not ours.** Don't edit the installed `miles` package —
+  extend via subclassing (`NLAFSDPActor`) and the `--*-path` function-pointer
+  args. The two upstream patches we depend on (`--custom-actor-cls-path`,
+  `--force-use-critic`) live as `.patch` files in `nla/miles_patches/`
+  (`0001`/`0002` + `UPSTREAM_PIN` version pin), applied to the installed
+  package — not vendored here. They're documented in `docs/design.md` §2.
 - Miles uses argparse; match that for CLIs in `nla/`.
+- **Two training backends.** FSDP (`nla/train_actor.py`, primary) and Megatron
+  (`nla/megatron/train_actor.py`). Both carry the same injection hook and
+  `cp_size == 1` invariant; keep changes to the actor in sync across both.
 - Storage and completion-provider backends are pluggable via import-path
   strings (`--storage-cls`, `--provider-cls`). The shipped implementations are
   `LocalStorage` and `AnthropicProvider`. Cloud storage / other LLM APIs are
@@ -41,6 +46,17 @@
 - **Sidecar is the contract.** Token IDs, prompt templates, `injection_scale`,
   `mse_scale`, `d_model` — all loaded from `nla_meta.yaml` and asserted
   against the live tokenizer at startup. Never hardcode them.
+- **Per-model constants live in `model_presets.py`.** `num_layers`, `d_model`,
+  `default_layer` (the 2/3-depth rule), and `extractor_kwargs` (batch size,
+  `device_map`) come from the `MODELS` dict via `resolve()` — one source of
+  truth, set by `model: <key>` in a datagen yaml. Don't re-derive layer/d_model
+  or scatter them across configs. Adding a model = a new `ModelPreset` entry
+  (qwen7b / gemma12b / gemma27b / llama70b / gpt_oss_20b today; the last is the
+  MoE/MXFP4 case — MXFP4 packing is on the expert MLPs only).
+- **Multimodal unwrapping goes through `arch_adapters.py`.** Wrapped HF
+  checkpoints (Gemma-3 `language_model`/`text_config`) get unwrapped to their
+  text side there. Extend `_WRAPPER_MODEL_ATTRS`/`_WRAPPER_CONFIG_ATTRS` —
+  don't duck-type new `getattr` fallbacks at callsites.
 
 ## Debugging
 
@@ -48,3 +64,11 @@ If injection silently fails the actor sees the literal CJK marker char and
 free-associates Chinese. Grep generated text for CJK — that's the loudest
 smoke test for the entire injection path. See `docs/inference.md`
 § "Debugging: injection-failure smell" for the cause checklist.
+
+## Where to look
+
+- `docs/design.md` — architecture, Miles integration, the two upstream
+  patches (§2), data transport, and the `nla/` package map (§6). Note §6's map
+  predates `arch_adapters.py`, `model_presets.py`, and `nla/megatron/`.
+- `docs/inference.md` — injection at inference time + debugging.
+- `docs/setup.md` — installing Miles and applying the patches.

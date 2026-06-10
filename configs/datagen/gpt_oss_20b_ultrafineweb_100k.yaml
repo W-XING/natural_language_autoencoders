@@ -1,0 +1,51 @@
+# gpt-oss-20b full 100k-doc run. ~500k API calls.
+#
+# stage2.cache_from: after the 1k smoke completes, point this at the smoke's
+# *_explained.parquet for partial reuse (same tokenizer → same text → cache
+# hits on the overlapping doc range). Without it this is a full-cost run.
+#
+# gpt-oss-20b is ungated — no HF_TOKEN required.
+# Run:    python -m nla.datagen.run_pipeline --config configs/datagen/gpt_oss_20b_ultrafineweb_100k.yaml
+
+model: gpt_oss_20b
+base_model: openai/gpt-oss-20b  # or local path if pre-downloaded
+layer_index: 17  # see gpt_oss_20b_ultrafineweb_1k.yaml
+output_dir: /tmp/nla_gpt_oss_20b_ultrafineweb_100k
+
+corpus:
+  name: openbmb/Ultra-FineWeb   # see qwen7b_ultrafineweb_100k.yaml header re: dataset size
+  config: null
+  split: en
+  text_column: content
+  start: 0
+  length: 100000
+
+stage0:
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42
+  multigpu: true
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  provider_cls: nla.datagen.providers.AnthropicProvider
+  provider_kwargs:
+    model: claude-sonnet-4-6
+    max_tokens: 300
+    temperature: 1.0
+    concurrency: 100
+  chunk_size: 65536
+
+stage3:
+  keep_debug_metadata: true
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage

@@ -76,6 +76,18 @@ MODELS: dict[str, ModelPreset] = {
         turn_marker="<|start_header_id|>",
         accepts_system_role=True,
     ),
+    "gpt_oss_20b": ModelPreset(
+        # First MoE base model: 32 experts/layer, MXFP4-packed expert MLPs
+        # (attention/router/embeddings are bf16). MXFP4 kernels need Hopper+.
+        # default_layer = (2*24)//3 = 16; configs pin layer_index=17 from the
+        # logit-lens KL probe over K∈{15,17,19}.
+        hf_name="openai/gpt-oss-20b",
+        num_layers=24,
+        d_model=2880,
+        extractor_kwargs={"batch_size": 4, "max_length": 4096, "device_map": "cuda:0"},
+        turn_marker="<|start|>",
+        accepts_system_role=True,
+    ),
 }
 
 

@@ -1,0 +1,54 @@
+# gpt-oss-20b 1k-doc smoke test. Measures INJ_SCALE, verifies layer-17
+# extraction, ~5k API calls. No cache_from — Harmony tokenizer ≠ anything
+# shipped, zero reuse.
+#
+# First MoE model: MXFP4-packed expert MLPs need Hopper+ (H100, not A100).
+# gpt-oss-20b is ungated — no HF_TOKEN required.
+# Run:    python -m nla.datagen.run_pipeline --config configs/datagen/gpt_oss_20b_ultrafineweb_1k.yaml
+
+model: gpt_oss_20b  # → d_model=2880, extractor batch_size=4, device_map=cuda:0
+base_model: openai/gpt-oss-20b  # or local path if pre-downloaded
+# Pinned from the logit-lens KL probe over K∈{15,17,19}; preset default_layer
+# would give 16. Advisory only — the real SWA-vs-150 check is the Phase-2
+# smoke loss-gap bucketed by response position.
+layer_index: 17
+output_dir: /tmp/nla_gpt_oss_20b_ultrafineweb_1k
+
+corpus:
+  name: openbmb/Ultra-FineWeb   # see qwen7b_ultrafineweb_100k.yaml header re: dataset size
+  config: null
+  split: en
+  text_column: content
+  start: 0
+  length: 1000
+
+stage0:
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42
+  # 20B MoE fits on one 80GB GPU dequantized; one proc/GPU like gemma.
+  multigpu: true
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  provider_cls: nla.datagen.providers.AnthropicProvider
+  provider_kwargs:
+    model: claude-sonnet-4-6
+    max_tokens: 300
+    temperature: 1.0
+    concurrency: 20
+  chunk_size: 65536
+
+stage3:
+  keep_debug_metadata: true
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage
