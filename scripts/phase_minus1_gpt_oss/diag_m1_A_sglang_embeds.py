@@ -26,7 +26,9 @@ from pathlib import Path
 
 import httpx
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from huggingface_hub import hf_hub_download
+from safetensors import safe_open
+from transformers import AutoTokenizer
 
 
 def post_generate(url: str, embeds: list, max_new: int) -> dict:
@@ -51,19 +53,22 @@ def main() -> None:
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    # Embedding table only — load on CPU, slice the rows we need.
-    print("loading embedding table (CPU)…")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, trust_remote_code=True, torch_dtype=torch.bfloat16, device_map="cpu"
-    )
-    embed = model.get_input_embeddings()
+    # Embedding table ONLY, straight from safetensors on CPU. Do NOT
+    # from_pretrained the model here: the MXFP4 quantizer runs CUDA packing
+    # even with device_map="cpu", and the SGLang server already owns the GPU
+    # (observed: client-side OOM with the server holding 69GiB).
+    print("loading embed_tokens from safetensors (CPU)…")
+    key = "model.embed_tokens.weight"
+    idx = json.load(open(hf_hub_download(args.model, "model.safetensors.index.json")))
+    shard_path = hf_hub_download(args.model, idx["weight_map"][key])
+    with safe_open(shard_path, framework="pt", device="cpu") as f:
+        embed_w = f.get_tensor(key)  # [vocab, d] bf16
 
     msgs = [{"role": "user", "content": "Briefly describe the following concept: <concept>X</concept>"}]
     prompt = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     input_ids = tok.encode(prompt, add_special_tokens=False)
-    ids_t = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
     with torch.no_grad():
-        base = embed(ids_t).float()  # [1, T, d]
+        base = embed_w[torch.tensor(input_ids, dtype=torch.long)].float().unsqueeze(0)  # [1, T, d]
 
     # Perturb ONE mid-sequence position (the 'X' inside <concept>) by replacing
     # its row with a large-norm random vector — same scale class as injection.
