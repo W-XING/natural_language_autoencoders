@@ -72,6 +72,12 @@ against dense, full-attention, single-channel models.
 
 ## Current state (correcting the existing plan's stale "to create" list)
 
+> **Correction (2026-06-10, control pod):** verification FAILED — none of the
+> items below were on `origin/main` or this clone; the original commits were
+> never pushed from the local machine. All were **recreated from this plan's
+> spec** on branch `gpt-oss-20b` (user-approved). Reconcile against the local
+> commits when they're pushed.
+
 Already committed — **verify, don't create**:
 - `nla/datagen/model_presets.py` — `gpt_oss_20b` preset (num_layers=24,
   d_model=2880, batch_size=4, device_map="cuda:0", turn_marker="<|start|>").
@@ -182,6 +188,68 @@ class CLAUDE.md warns about (wrong position → model emits Chinese).
 
 **End of Phase −1: STOP.** Report the three gates + calibrations + a firm cost
 estimate; wait for the user's go/no-go.
+
+## Phase −1 RESULTS (run 2026-06-10, 1×H100 SXM on-demand, ~2 GPU-h ≈ $7)
+
+Scripts: `scripts/phase_minus1_gpt_oss/` (branch `gpt-oss-20b`). Verdict JSONs:
+control pod `~/phase_minus1_results/`, pod volume `/workspace/logs/`.
+
+| Gate | Result |
+|---|---|
+| −1.0 expert trainability | **FAIL — decision pending** |
+| −1.A SGLang input_embeds | **PASS** |
+| −1.B Harmony loss-mask/channels | **FAIL — fix designed, decision pending** |
+| −1.B′ MoE critic truncation | **PASS** |
+| −1.D marker/neighbor round-trip | **PASS** |
+| Phase-0 INJ_SCALE | **measured: 5447–5901 @ K=17** |
+
+- **−1.0:** as the actor loads it (plain `from_pretrained`, Hopper, kernels
+  installed), the ~19B MXFP4 expert weights are `triton_kernels` custom tensors
+  — in NEITHER `named_parameters` nor `named_buffers`; only 1.8B/20.9B params
+  optimizer-visible. Backward probe: experts AND **router get zero grad** (the
+  packed MoE forward is non-differentiable end-to-end) — so option (a)
+  "train attn/router/embed" is really "attention+embeddings only, router
+  frozen". Only path that trains the MoE: **(b) dequant-to-bf16 at actor load**
+  (~42GB weights; ≈42GB/GPU optimizer-state share on 8×H100 — redo the Phase-4
+  memory accounting). Packed-load peak was 17.3 GiB on 1 GPU.
+- **−1.A:** stock SGLang 0.5.9 **consumes** input_embeds for gpt_oss — two
+  payloads differing only at the ㎡ position (perturbation norm 5500) gave
+  completely different greedy outputs. **No gpt_oss routing patch needed**; the
+  HF-generate fallback is dead. Still untested: MoE `update_weights` round-trip
+  (RL prerequisite, test at Phase-5 bring-up).
+- **−1.B:** confirmed both ways. The `generic` `_turn_close_ids` assert fires
+  (Harmony inserts `<|channel|>final<|message|>` = tokens [200005, 17196,
+  200008] between gen-prompt and content; close is `<|return|>` = 200002).
+  `<explanation>` extraction breaks even NON-adversarially: the analysis
+  channel merely *mentioning* the tag corrupts the first-match regex across
+  channels. Fix options (decision pending): **(A, recommended) forced-final
+  prefill** — append `<|channel|>final<|message|>` to the generation prompt in
+  SFT data + rollouts, analysis channel structurally impossible, ~30–60 LOC,
+  CPU-verifiable; (B) native two-channel with channel-aware mask/extraction —
+  2–4× RL token cost, SFT targets have no analysis content; (C) learned
+  suppression (channel header in SFT target) — same mask fix as A but RL can
+  drift back. Harden `extract_explanation` (final-channel anchor) regardless.
+- **−1.B′:** truncation covers all gpt-oss per-layer config attrs; truncated
+  critic keeps layers 0..17 with router + 32-expert tensors uniform per layer;
+  `GptOssDecoderLayer` in `_no_split_modules`.
+- **−1.D:** ㎡/83806 + neighbors round-trip `apply_chat_template` exactly; the
+  injection hook finds exactly 1 position and agrees with the sidecar.
+- **Phase-0:** residual norms at extracted positions (32 UltraFineWeb docs):
+  p50–p90 = **5447–5901 @ K=17** (K=15 ≈ 3068, K=19 ≈ 9960 — steeply
+  depth-dependent). Logit-lens KL non-monotonic (4.19 / 4.84 / 3.78 for
+  15/17/19) — advisory only, per plan. Smoke default stays K=17.
+- **Env pins discovered (bake into the image):** `kernels==0.9.0` — versions
+  0.10–0.15 crash at import against `huggingface_hub<1.0` (which
+  transformers 4.57 requires). Stack: torch 2.9.1+cu128, transformers 4.57.1,
+  sglang 0.5.9. Also: the MXFP4 quantizer runs CUDA packing even under
+  `device_map="cpu"` — never `from_pretrained` the model on a GPU another
+  process owns (read tensors via safetensors instead).
+
+**Go/no-go status:** awaiting user. Open items: the two research decisions
+above (−1.0 path, −1.B option), a **read/write** RunPod API key (current key is
+read-only — pods can be listed but not created/stopped via API), and balance
+top-up (was $199.70; billed envelope $1.7–5k at on-demand rates, RL step-time
+still the dominant unknown until the 20-step measurement).
 
 ---
 
