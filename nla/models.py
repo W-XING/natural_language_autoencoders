@@ -33,6 +33,42 @@ from nla.arch_adapters import resolve_text_config, resolve_text_model
 _EMBED_KEY_SUFFIXES = ("embed_tokens.weight", "wte.weight", "word_embeddings.weight")
 
 
+def mxfp4_dequantize_kwargs(
+    pretrained_model_name_or_path: str, trust_remote_code: bool = True
+) -> dict:
+    """from_pretrained kwargs that make MXFP4 checkpoints (gpt-oss) trainable.
+
+    Phase −1.0 finding (gpt-oss-20b, user-confirmed decision 2026-06-11):
+    under a default load the MXFP4-packed expert MLPs come up as
+    triton_kernels custom tensors — present in NEITHER named_parameters nor
+    named_buffers — and the packed MoE forward has no autograd backward, so
+    experts AND router receive zero gradient (only 1.8B of 20.9B params are
+    optimizer-visible). The only path that trains the MoE is
+    Mxfp4Config(dequantize=True): experts load as bf16 nn.Parameters
+    (~42 GB weights; redo memory planning before 8-GPU runs).
+
+    Returns {} for non-MXFP4 checkpoints — safe to call unconditionally at
+    every TRAINING load site. Datagen extraction (stage0) deliberately does
+    NOT use this: forward-only, packed weights are fine and 4× smaller.
+    """
+    config = AutoConfig.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+    )
+    qc = getattr(config, "quantization_config", None)
+    method = qc.get("quant_method") if isinstance(qc, dict) else getattr(qc, "quant_method", None)
+    if method != "mxfp4":
+        return {}
+    from transformers import Mxfp4Config  # transformers>=4.55; import here so
+
+    # non-MoE models never need the symbol.
+    print(
+        f"[NLA] {pretrained_model_name_or_path}: MXFP4 quantization_config "
+        f"detected → loading with Mxfp4Config(dequantize=True) so the expert "
+        f"MLPs are trainable bf16 parameters (Phase −1.0 decision)."
+    )
+    return {"quantization_config": Mxfp4Config(dequantize=True)}
+
+
 @dataclass
 class NLACriticOutput:
     values: torch.Tensor  # [B, T, d_model] — value-head output at every position
@@ -109,6 +145,14 @@ class NLACriticModel(PreTrainedModel):
         # Miles' fsdp_utils/actor.py:96 passes trust_remote_code + attn_implementation
         # via kwargs. Default to True if caller doesn't specify.
         kwargs.setdefault("trust_remote_code", True)
+        # gpt-oss: critic is trained too — its truncated checkpoint keeps the
+        # MXFP4 quantization_config (prepare_critic_checkpoint copies
+        # config.json), so the experts must dequantize here as well. Explicit
+        # caller-passed quantization_config wins over the detection.
+        for k, v in mxfp4_dequantize_kwargs(
+            pretrained_model_name_or_path, kwargs["trust_remote_code"]
+        ).items():
+            kwargs.setdefault(k, v)
         config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path, trust_remote_code=kwargs["trust_remote_code"]
         )

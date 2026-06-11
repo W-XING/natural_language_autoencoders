@@ -19,7 +19,7 @@ from pathlib import Path
 import yaml
 
 from nla.datagen.storage import Storage, sidecar_path_str
-from nla.schema import NLATokenMeta, sidecar_path_for
+from nla.schema import ACTOR_REASONING_MODES, NLATokenMeta, sidecar_path_for
 
 SCHEMA_VERSION = 1
 
@@ -56,6 +56,10 @@ class NLADatasetMeta:
     keep_debug_metadata: bool = True
     tokens: NLATokenMeta | None = None
     prompt_templates: dict[str, str] = field(default_factory=dict)
+    # See nla.schema.ACTOR_REASONING_MODES. "forced_final" (Harmony/gpt-oss)
+    # obligates training to --loss-mask-type harmony and rollouts to prefill
+    # <|channel|>final<|message|> — train_actor asserts the pairing.
+    actor_reasoning_mode: str = "default"
     api_summaries: NLAApiSummaryMeta | None = None
     parent_datasets: list[str] = field(default_factory=list)
     created_at: str = ""
@@ -75,6 +79,10 @@ _TRAINING_STAGES = {"av_sft", "ar_sft", "rl"}
 
 def serialize_sidecar(meta: NLADatasetMeta) -> str:
     """Validate + serialize to YAML string. Pure — no IO."""
+    assert meta.actor_reasoning_mode in ACTOR_REASONING_MODES, (
+        f"actor_reasoning_mode={meta.actor_reasoning_mode!r} not in "
+        f"{ACTOR_REASONING_MODES}"
+    )
     if meta.stage in _TRAINING_STAGES:
         assert meta.tokens is not None, (
             f"stage={meta.stage!r} requires NLATokenMeta — training-side config.py "

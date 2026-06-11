@@ -31,6 +31,67 @@ EXPLANATION_RE = re.compile(
     re.DOTALL,
 )
 
+# How the actor produces its explanation. Recorded in the sidecar at datagen
+# (stage3_build --actor-reasoning-mode), asserted at training startup
+# (data-mode must equal runtime-mode), applied at rollout (nla_generate).
+#   "default"      — single-channel chat template (Qwen/Gemma/Llama).
+#   "forced_final" — Harmony (gpt-oss): the generation prompt is prefilled
+#     with <|channel|>final<|message|> so an analysis channel is structurally
+#     impossible. SFT trains with --loss-mask-type harmony (miles patch 0003):
+#     prompt = chat-template head + that prefix (masked), supervised tokens =
+#     explanation content + <|return|>.
+ACTOR_REASONING_MODES = ("default", "forced_final")
+
+# Harmony final-channel header as a STRING — used only by extract_explanation
+# to isolate the final channel in decoded text. Token IDs are never derived
+# from this constant; they come from compute_harmony_affixes (live tokenizer).
+HARMONY_FINAL_MARKER = "<|channel|>final<|message|>"
+
+
+def compute_harmony_affixes(tokenizer: Any) -> tuple[list[int], list[int]]:
+    """Resolve (final_prefix_ids, close_ids) from a Harmony chat template.
+
+    Renders a (user, assistant) probe and diffs it against the generation
+    prompt: full = head + prefix + body + close. For gpt-oss the result is
+    prefix = <|channel|>final<|message|> = [200005, 17196, 200008] and
+    close = [<|return|>] = [200002] — but callers must use the returned IDs,
+    never those literals (tokenizer is the source of truth).
+
+    Raises AssertionError on a non-Harmony template (prefix would be empty —
+    single-channel templates put nothing between head and body).
+
+    Used by: nla_generate (prefill prefix under forced_final), stage3_build +
+    config.py (verify the tokenizer is Harmony-templated when the sidecar says
+    forced_final). The miles harmony loss-mask branch (patch 0003) re-derives
+    the same affixes with identical probe logic on its side.
+    """
+    probe = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]
+    full = tokenizer.apply_chat_template(probe, tokenize=True, add_generation_prompt=False)
+    head = tokenizer.apply_chat_template(probe[:1], tokenize=True, add_generation_prompt=True)
+    body = tokenizer("y", add_special_tokens=False)["input_ids"]
+    lcp = 0
+    while lcp < min(len(full), len(head)) and full[lcp] == head[lcp]:
+        lcp += 1
+    # Locate body inside full[lcp:] — everything between is the channel prefix.
+    starts = [
+        i for i in range(lcp, len(full) - len(body) + 1)
+        if full[i:i + len(body)] == body
+    ]
+    assert len(starts) == 1, (
+        f"cannot isolate assistant body in Harmony probe render: body={body} "
+        f"occurs {len(starts)}× in full[{lcp}:]={full[lcp:]} — template structure "
+        f"unexpected, inspect apply_chat_template output."
+    )
+    prefix = full[lcp:starts[0]]
+    close = full[starts[0] + len(body):]
+    assert prefix, (
+        f"chat template emits no tokens between generation prompt and assistant "
+        f"content — this is a single-channel template, not Harmony. "
+        f"full={full} head={head}"
+    )
+    assert close, f"chat template emits no close token after assistant content: full={full}"
+    return prefix, close
+
 
 def wrap_explanation(text: str) -> str:
     """Wrap text in explanation tags for the AV-SFT response column.
@@ -48,7 +109,20 @@ def extract_explanation(response: str) -> str | None:
     to fill the critic template (the raw api_explanation, no \n wrapper).
     Without this, RL queries the critic with <text>\nfoo\n</text> but AR-SFT
     trained it on <text>foo</text> — different tokens.
+
+    Harmony hardening (Phase −1.B): if the decoded response still contains
+    channel headers, match only AFTER the last <|channel|>final<|message|> —
+    an analysis channel that merely *mentions* the explanation tags must not
+    win the first-match regex. No-op for single-channel models and for
+    forced_final responses (prefill consumed the header, so it never appears).
+    Limitation: if the response was decoded with skip_special_tokens=True the
+    channel structure is already gone and analysis text is indistinguishable
+    from final text — forced_final is the structural fix; this is best-effort
+    for free-running multi-channel output.
     """
+    idx = response.rfind(HARMONY_FINAL_MARKER)
+    if idx != -1:
+        response = response[idx + len(HARMONY_FINAL_MARKER):]
     m = EXPLANATION_RE.search(response)
     return m.group(1).strip() if m else None
 

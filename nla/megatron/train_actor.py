@@ -394,6 +394,25 @@ class NLAMegatronActor(MegatronTrainRayActor):
                 "it's a training hyperparameter, pick explicitly. "
                 f"(Resolved sidecar: {sidecar_source!r}, injection_scale: None.)"
             )
+        # Phase −1.B contract: forced_final data ⇔ harmony loss mask. Same
+        # check as NLAFSDPActor.init — keep in sync (CLAUDE.md invariant).
+        if injects and self.args.loss_type == "sft_loss":
+            mask_type = getattr(self.args, "loss_mask_type", None)
+            if cfg.actor_reasoning_mode == "forced_final":
+                assert mask_type == "harmony", (
+                    f"sidecar actor_reasoning_mode='forced_final' (Harmony prefill "
+                    f"<|channel|>final<|message|>) requires --loss-mask-type harmony, "
+                    f"got {mask_type!r}. The generic mask asserts on Harmony's channel "
+                    f"tokens; training would crash or mask the wrong span."
+                )
+            else:
+                assert mask_type != "harmony", (
+                    f"--loss-mask-type harmony but sidecar actor_reasoning_mode="
+                    f"{cfg.actor_reasoning_mode!r} — harmony masking puts "
+                    f"<|channel|>final<|message|> on the prompt side; data built "
+                    f"without forced_final would be mis-split. Rebuild stage3 with "
+                    f"--actor-reasoning-mode forced_final or drop the harmony mask."
+                )
         self._nla_cfg: NLAConfig = cfg
         self.args.nla_mse_scale = cfg.mse_scale
         # FVE baselines for loss logging (loss.py:108-113 reads via getattr and

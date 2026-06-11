@@ -1,0 +1,130 @@
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index 28a117e82..4b0875aea 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -1467,9 +1467,12 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                 "--loss-mask-type",
+                 type=str,
+                 default="qwen",
+-                choices=["qwen", "qwen3", "distill_qwen", "generic"],
++                choices=["qwen", "qwen3", "distill_qwen", "generic", "harmony"],
+                 help="Loss mask type. 'generic' is tokenizer-agnostic "
+-                     "(apply_chat_template + length split, single-user-turn only)",
++                     "(apply_chat_template + length split, single-user-turn only). "
++                     "'harmony' is for gpt-oss channel templates: prompt = head + "
++                     "<|channel|>final<|message|> (masked), response = content + "
++                     "<|return|> (supervised) — pairs with NLA forced_final rollouts.",
+             )
+             parser.add_argument(
+                 "--data-pad-size-multiplier",
+diff --git a/miles/utils/mask_utils.py b/miles/utils/mask_utils.py
+index 0cc5bce1a..ea50656b4 100644
+--- a/miles/utils/mask_utils.py
++++ b/miles/utils/mask_utils.py
+@@ -11,6 +11,7 @@ class MultiTurnLossMaskGenerator:
+         self.tokenizer = tokenizer
+         self.tokenizer_type = tokenizer_type
+         self._cached_turn_close_ids: list[int] | None = None
++        self._cached_harmony_affixes: tuple[list[int], list[int]] | None = None
+         # get_system_message_length sends [user, user] to the chat template to
+         # measure the implicit system prefix. Gemma's template raises on
+         # non-alternating roles. The generic/distill_qwen path doesn't use
+@@ -43,6 +44,42 @@ class MultiTurnLossMaskGenerator:
+         self._cached_turn_close_ids = full[lcp+len(body):]
+         return self._cached_turn_close_ids
+ 
++    def _harmony_affixes(self) -> tuple[list[int], list[int]]:
++        """(final_prefix_ids, close_ids) the Harmony template wraps around
++        assistant content. gpt-oss: <|channel|>final<|message|> = [200005,
++        17196, 200008] and <|return|> = [200002] — resolved from the LIVE
++        tokenizer, never hardcoded. Same probe as _turn_close_ids, but instead
++        of asserting body follows head directly, locate body and split the
++        remainder into prefix (between head and body) and close (after body).
++        Mirrors nla.schema.compute_harmony_affixes — keep the two in sync.
++        """
++        if self._cached_harmony_affixes is not None:
++            return self._cached_harmony_affixes
++        probe = [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}]
++        full = self.tokenizer.apply_chat_template(probe, tokenize=True, add_generation_prompt=False)
++        head = self.tokenizer.apply_chat_template(probe[:1], tokenize=True, add_generation_prompt=True)
++        body = self.tokenizer("y", add_special_tokens=False)["input_ids"]
++        lcp = 0
++        while lcp < min(len(full), len(head)) and full[lcp] == head[lcp]:
++            lcp += 1
++        starts = [
++            i for i in range(lcp, len(full) - len(body) + 1)
++            if full[i:i + len(body)] == body
++        ]
++        assert len(starts) == 1, (
++            f"cannot isolate assistant body in Harmony probe render: "
++            f"full={full} head={head} body={body} lcp={lcp} starts={starts}"
++        )
++        prefix, close = full[lcp:starts[0]], full[starts[0] + len(body):]
++        assert prefix, (
++            f"no tokens between generation prompt and assistant content — "
++            f"single-channel template, use tokenizer_type='generic' instead. "
++            f"full={full} head={head}"
++        )
++        assert close, f"no close token after assistant content: full={full}"
++        self._cached_harmony_affixes = (prefix, close)
++        return self._cached_harmony_affixes
++
+     def get_response_lengths(self, loss_masks: list[list[int]]) -> list[int]:
+         return get_response_lengths(loss_masks)
+ 
+@@ -162,6 +199,43 @@ class MultiTurnLossMaskGenerator:
+             loss_mask = [0] * len(token_ids)
+         return token_ids, loss_mask
+ 
++    def gen_multi_turn_loss_mask_harmony(
++        self, messages: list[dict], tools: list[dict] = None
++    ) -> tuple[list[int], list[int]]:
++        """Harmony (gpt-oss) forced_final split — NLA patch 0003.
++
++        The generic path can't serve Harmony: the template renders assistant
++        content as <|start|>assistant<|channel|>final<|message|>{content}
++        <|return|>, so _turn_close_ids' "full = head + body + close"
++        assumption breaks on the channel header. Layout here:
++
++          prompt   = chat-template head (ends <|start|>assistant)
++                     + <|channel|>final<|message|>   ← MASKED. Rollouts
++                       prefill these tokens (NLA forced_final mode), so the
++                       model never generates them and must not be supervised
++                       on them.
++          response = content tokens + <|return|>     ← supervised; <|return|>
++                       teaches the model to close the turn.
++
++        Single-user-turn only, like generic. The prompt side MUST equal the
++        rollout prompt nla_generate builds (head + same prefix) — divergence
++        means SFT and RL train on different prompt token streams.
++        """
++        prompt = self.tokenizer.apply_chat_template(
++            messages[:1], tokenize=False, add_generation_prompt=True, tools=tools
++        )
++        response = messages[-1]["content"]
++        prefix_ids, close_ids = self._harmony_affixes()
++        prompt_tokens = self.tokenizer(prompt, add_special_tokens=False)["input_ids"] + prefix_ids
++        response_tokens = self.tokenizer(response, add_special_tokens=False)["input_ids"] + close_ids
++
++        token_ids = prompt_tokens + response_tokens
++        loss_mask = [0] * len(prompt_tokens) + [1] * len(response_tokens)
++
++        if messages[-1].get("step_loss_mask", 1) != 1:
++            loss_mask = [0] * len(token_ids)
++        return token_ids, loss_mask
++
+     def get_loss_mask(self, messages: list[dict], tools: list[dict] = None) -> tuple[list[int], list[int]]:
+         if self.tokenizer_type == "qwen":
+             if "<｜Assistant｜>" in self.tokenizer.get_added_vocab():
+@@ -175,6 +249,11 @@ class MultiTurnLossMaskGenerator:
+             # chat_template (Gemma, Llama, etc). Single-user-turn only.
+             # distill_qwen is the same function; kept for backward compat.
+             return self.gen_multi_turn_loss_mask_distill_qwen(messages, tools)
++        elif self.tokenizer_type == "harmony":
++            # Harmony channel templates (gpt-oss). Pairs with NLA's
++            # actor_reasoning_mode='forced_final' — train_actor asserts the
++            # pairing at startup.
++            return self.gen_multi_turn_loss_mask_harmony(messages, tools)
+         else:
+             raise ValueError(f"Unsupported tokenizer type: {self.tokenizer_type}")
+ 

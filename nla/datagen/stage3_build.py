@@ -41,7 +41,7 @@ from tqdm import tqdm
 from nla.datagen._common import add_storage_args, load_tokenizer, make_storage
 from nla.datagen.injection_tokens import build_token_meta
 from nla.datagen.sidecar import read_sidecar, write_sidecar
-from nla.schema import wrap_explanation
+from nla.schema import ACTOR_REASONING_MODES, compute_harmony_affixes, wrap_explanation
 
 _INJECT_PLACEHOLDER = "<INJECT>"
 
@@ -170,6 +170,10 @@ def main() -> None:
     p.add_argument("--output", required=True)
     p.add_argument("--actor-template", default=_DEFAULT_ACTOR_TEMPLATE)
     p.add_argument("--critic-template", default=_DEFAULT_CRITIC_TEMPLATE)
+    p.add_argument("--actor-reasoning-mode", default="default", choices=ACTOR_REASONING_MODES,
+                   help="'forced_final' for Harmony models (gpt-oss): training must use "
+                        "--loss-mask-type harmony, rollouts prefill <|channel|>final<|message|>. "
+                        "Recorded in the sidecar; train_actor asserts data-mode == runtime-mode.")
     p.add_argument("--keep-debug-metadata", action=argparse.BooleanOptionalAction, default=True,
                    help="carry detokenized_text_truncated through "
                         "(heavy; off for prod). Provenance (n_raw_tokens/doc_id/activation_layer) "
@@ -201,6 +205,13 @@ def main() -> None:
     )
 
     tokenizer = load_tokenizer(in_meta.extraction.base_model)
+
+    if args.actor_reasoning_mode == "forced_final":
+        # Fail at build time if the tokenizer isn't Harmony-templated — the
+        # mode is unusable downstream otherwise. IDs are informational here;
+        # training/rollout re-derive them from their own live tokenizer.
+        ff_prefix, ff_close = compute_harmony_affixes(tokenizer)
+        print(f"forced_final affixes (informational): prefix={ff_prefix} close={ff_close}")
 
     # ar_sft needs critic suffix IDs; av_sft/rl don't.
     critic_template_for_meta = args.critic_template if args.stage == "ar_sft" else None
@@ -265,6 +276,7 @@ def main() -> None:
         keep_debug_metadata=args.keep_debug_metadata,
         tokens=token_meta,
         prompt_templates={"actor": args.actor_template, "critic": args.critic_template},
+        actor_reasoning_mode=args.actor_reasoning_mode,
         parent_datasets=[in_meta.dataset_id],
         created_by="nla.datagen.stage3_build",
         created_at="",

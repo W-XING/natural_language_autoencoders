@@ -16,7 +16,14 @@ from typing import Any
 
 import yaml
 
-from nla.schema import SCALE_SQRT_D, compute_canonical_neighbors, resolve_target_scale, sidecar_path_for
+from nla.schema import (
+    ACTOR_REASONING_MODES,
+    SCALE_SQRT_D,
+    compute_canonical_neighbors,
+    compute_harmony_affixes,
+    resolve_target_scale,
+    sidecar_path_for,
+)
 from nla.storage import fetch_sidecar_to_local_cache, is_remote
 
 
@@ -139,6 +146,12 @@ class NLAConfig:
     injection_scale: float | None = None
     mse_scale: float | None = None
 
+    # How the actor produces its explanation — see schema.ACTOR_REASONING_MODES.
+    # "forced_final" (Harmony/gpt-oss): nla_generate prefills
+    # <|channel|>final<|message|> onto the generation prompt; SFT must run with
+    # --loss-mask-type harmony (asserted in train_actor init, both backends).
+    actor_reasoning_mode: str = "default"
+
     @property
     def sqrt_d(self) -> float:
         return math.sqrt(self.d_model)
@@ -189,6 +202,14 @@ def load_nla_config(sidecar_source: str, tokenizer) -> NLAConfig:
     # v2 writes "extraction_layer_index". Read both for back-compat.
     critic_k = critic_meta.get("extraction_layer_index", critic_meta.get("num_hidden_layers"))
 
+    # Absent key (pre-gpt-oss sidecars) → "default". Written by stage3_build
+    # for datasets and write_model_sidecar for checkpoints.
+    actor_reasoning_mode = meta.get("actor_reasoning_mode", "default")
+    assert actor_reasoning_mode in ACTOR_REASONING_MODES, (
+        f"sidecar actor_reasoning_mode={actor_reasoning_mode!r} not in "
+        f"{ACTOR_REASONING_MODES} — sidecar written by a newer schema?"
+    )
+
     cfg = NLAConfig(
         d_model=d_model,
         injection_char=t["injection_char"],
@@ -201,7 +222,14 @@ def load_nla_config(sidecar_source: str, tokenizer) -> NLAConfig:
         critic_suffix_ids=t.get("critic_suffix_ids"),
         injection_scale=injection_scale,
         mse_scale=mse_scale,
+        actor_reasoning_mode=actor_reasoning_mode,
     )
+
+    if cfg.actor_reasoning_mode == "forced_final":
+        # Fail at load, not mid-rollout: the live tokenizer must be
+        # Harmony-templated or the prefill IDs can't be resolved.
+        # compute_harmony_affixes asserts internally (non-empty prefix/close).
+        compute_harmony_affixes(tokenizer)
 
     # encode(), not convert_tokens_to_ids(): byte-level BPE tokenizers (Qwen,
     # GPT-2) store the byte-string representation as the token key, not the
@@ -289,6 +317,7 @@ def write_model_sidecar(checkpoint_dir: str, cfg: NLAConfig, *, role: str, stage
             "actor": cfg.actor_prompt_template,
             "critic": cfg.critic_prompt_template,
         },
+        "actor_reasoning_mode": cfg.actor_reasoning_mode,
         "trained_on": trained_on,
         "parent_checkpoints": parent_checkpoints,
         "created_at": datetime.datetime.now(tz=datetime.UTC).isoformat(),

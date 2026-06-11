@@ -40,7 +40,7 @@ from miles.backends.training_utils.loss import loss_function
 from nla.arch_adapters import resolve_text_config, resolve_text_model
 from nla.config import NLAConfig, load_nla_config_from_args, write_model_sidecar
 from nla.injection import inject_at_marked_positions
-from nla.models import NLACriticModel, embed_dump_path
+from nla.models import NLACriticModel, embed_dump_path, mxfp4_dequantize_kwargs
 from nla.schema import (
     MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, MM_MSE_SCALE_KEY,
     load_predict_mean_baselines, normalize_activation,
@@ -230,6 +230,14 @@ class NLATextOnlyCausalLM:
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+        # gpt-oss: MXFP4 expert MLPs are non-trainable under a default load
+        # (Phase −1.0) — dequantize to bf16 nn.Parameters at every TRAINING
+        # load (actor here, ref model via the same shim, critic via
+        # NLACriticModel.from_pretrained). {} for non-MXFP4 checkpoints.
+        for k, v in mxfp4_dequantize_kwargs(
+            pretrained_model_name_or_path, kwargs.get("trust_remote_code", True)
+        ).items():
+            kwargs.setdefault(k, v)
         model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path, **kwargs)
         return resolve_text_model(model)
 
@@ -416,6 +424,28 @@ class NLAFSDPActor(FSDPTrainRayActor):
                 "it's a training hyperparameter, pick explicitly. "
                 f"(Resolved sidecar: {sidecar_source!r}, injection_scale: None.)"
             )
+        # Phase −1.B contract: forced_final data ⇔ harmony loss mask. SFT-only
+        # check — RL never runs MultiTurnLossMaskGenerator (rollout masks come
+        # from response_length), and rollouts get the prefill from nla_generate
+        # reading the same cfg.actor_reasoning_mode.
+        if injects and args.loss_type == "sft_loss":
+            mask_type = getattr(args, "loss_mask_type", None)
+            if cfg.actor_reasoning_mode == "forced_final":
+                assert mask_type == "harmony", (
+                    f"sidecar actor_reasoning_mode='forced_final' (Harmony prefill "
+                    f"<|channel|>final<|message|>) requires --loss-mask-type harmony, "
+                    f"got {mask_type!r}. The generic mask asserts on Harmony's channel "
+                    f"tokens; training would crash or mask the wrong span."
+                )
+            else:
+                assert mask_type != "harmony", (
+                    f"--loss-mask-type harmony but sidecar actor_reasoning_mode="
+                    f"{cfg.actor_reasoning_mode!r} — harmony masking puts "
+                    f"<|channel|>final<|message|> on the prompt side; data built "
+                    f"without forced_final would be mis-split. Rebuild stage3 with "
+                    f"--actor-reasoning-mode forced_final or drop the harmony mask."
+                )
+
         self._nla_cfg: NLAConfig = cfg
         self._nla_vectors: torch.Tensor | None = None
         # Expose mse_scale on args so nla_critic_loss can read it backend-agnostically.

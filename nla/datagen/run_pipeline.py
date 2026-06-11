@@ -120,13 +120,14 @@ def _stage2(cfg: dict[str, Any], p: dict[str, str]) -> None:
 def _stage3(cfg: dict[str, Any], p: dict[str, str]) -> None:
     s3 = cfg["stage3"]
     debug_flag = "--keep-debug-metadata" if s3["keep_debug_metadata"] else "--no-keep-debug-metadata"
+    mode = ["--actor-reasoning-mode", s3.get("actor_reasoning_mode", "default")]
     storage = _storage_args(cfg)
     _run([sys.executable, "-m", "nla.datagen.stage3_build",
-          "--input", p["av_sft_explained"], "--stage", "av_sft", "--output", p["av_sft"], debug_flag, *storage])
+          "--input", p["av_sft_explained"], "--stage", "av_sft", "--output", p["av_sft"], debug_flag, *mode, *storage])
     _run([sys.executable, "-m", "nla.datagen.stage3_build",
-          "--input", p["ar_sft_explained"], "--stage", "ar_sft", "--output", p["ar_sft"], debug_flag, *storage])
+          "--input", p["ar_sft_explained"], "--stage", "ar_sft", "--output", p["ar_sft"], debug_flag, *mode, *storage])
     _run([sys.executable, "-m", "nla.datagen.stage3_build",
-          "--input", p["rl_raw"], "--stage", "rl", "--output", p["rl"], debug_flag, *storage])
+          "--input", p["rl_raw"], "--stage", "rl", "--output", p["rl"], debug_flag, *mode, *storage])
 
 
 def _shuffle(cfg: dict[str, Any], p: dict[str, str]) -> None:

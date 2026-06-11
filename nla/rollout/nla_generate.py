@@ -41,11 +41,21 @@ from nla.arch_adapters import resolve_embed_scale
 from nla.config import load_nla_config_from_args
 from nla.injection import inject_at_marked_positions
 from nla.models import embed_dump_path, load_embedding_only
-from nla.schema import MM_ACTIVATION_KEY, MM_CRITIC_TOKENS_KEY, extract_explanation, normalize_activation
+from nla.schema import (
+    MM_ACTIVATION_KEY,
+    MM_CRITIC_TOKENS_KEY,
+    compute_harmony_affixes,
+    extract_explanation,
+    normalize_activation,
+)
 
 
 _TOKENIZER = None
 _CFG = None
+# Harmony forced_final: token IDs appended to every generation prompt
+# (<|channel|>final<|message|>, resolved from the live tokenizer in
+# _lazy_init). Empty list = mode is "default" = no-op concatenation.
+_FORCED_FINAL_PREFIX: list[int] = []
 _EMBED: torch.nn.Embedding | None = None
 _EMBED_SCALE: float = 1.0
 _EMBED_MTIME: float = 0.0
@@ -71,7 +81,7 @@ _ENGINE_URLS_LOCK = asyncio.Lock()
 
 
 def _lazy_init(args):
-    global _TOKENIZER, _CFG, _EMBED, _EMBED_SCALE
+    global _TOKENIZER, _CFG, _EMBED, _EMBED_SCALE, _FORCED_FINAL_PREFIX
     if _TOKENIZER is not None:
         return
     _TOKENIZER = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
@@ -88,6 +98,13 @@ def _lazy_init(args):
         "from sample.prompt, ignores prior partial response)"
     )
     _CFG = cfg
+    if cfg.actor_reasoning_mode == "forced_final":
+        # Prefill the Harmony final-channel header so the actor cannot open an
+        # analysis channel (Phase −1.B decision). Must mirror the SFT-side
+        # prompt: miles' harmony loss-mask branch (patch 0003) puts the same
+        # prefix on the prompt side of the mask. gpt-oss: [200005, 17196, 200008].
+        _FORCED_FINAL_PREFIX, _ = compute_harmony_affixes(_TOKENIZER)
+        print(f"[NLA] forced_final: prefilling {_FORCED_FINAL_PREFIX} after the generation prompt")
     # bf16 storage — the bf16→fp32 conversion of 1GB (whole table) was ~1s per
     # reload. Instead convert only the looked-up rows (~125×3584 ≈ 900KB) per
     # request in generate().
@@ -173,6 +190,12 @@ def _prep_payload_sync(args, messages, activation_vector, sampling_params, sampl
     # (compute_canonical_neighbors uses one-step tokenize), but only after
     # you've already shipped a broken checkpoint.
     input_ids = _TOKENIZER.encode(prompt_str, add_special_tokens=False)
+    # forced_final prefill goes BEFORE the embedding lookup — the prefix tokens
+    # need embeddings too, and they count as prompt (SGLang generates after
+    # them; update_sample_from_response sees them inside the prompt ids, so
+    # sample.response starts at the explanation content — matching the harmony
+    # loss-mask's prompt/response split at SFT time).
+    input_ids = input_ids + _FORCED_FINAL_PREFIX
     ids_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)  # [1, T]
 
     with torch.no_grad():

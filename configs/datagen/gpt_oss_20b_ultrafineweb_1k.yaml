@@ -46,6 +46,10 @@ stage2:
 
 stage3:
   keep_debug_metadata: true
+  # Harmony decision (Phase −1.B, user-confirmed 2026-06-11): prefill
+  # <|channel|>final<|message|> so no analysis channel exists. Training must
+  # pair this with --loss-mask-type harmony (asserted at startup).
+  actor_reasoning_mode: forced_final
 
 shuffle:
   enabled: true
