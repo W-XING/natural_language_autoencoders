@@ -42,11 +42,12 @@ conda activate miles
 uv pip install -e .
 ```
 
-NLA requires the integration patch in `nla/miles_patches/` (adds
-`--custom-actor-cls-path`, `--force-use-critic`, and the NLA arg group; see
-[docs/design.md §2](design.md)). It is generated against the commit in
+NLA requires the integration patches in `nla/miles_patches/` (`0001`/`0002`
+add `--custom-actor-cls-path`, `--force-use-critic`, and the NLA arg group;
+`0003` adds the `harmony` loss-mask branch for gpt-oss forced_final SFT; see
+[docs/design.md §2](design.md)). They are generated against the commit in
 `UPSTREAM_PIN` — checking that out first is what makes `git apply` succeed
-cleanly:
+cleanly (the glob applies in `0001`→`0002`→`0003` order):
 
 ```bash
 cd miles

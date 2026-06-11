@@ -104,6 +104,15 @@ SGLang's HTTP `/generate` accepts `input_embeds` (stock SGLang feature, not mile
 
 ## 2. Required Upstream Changes (exactly two)
 
+> Patch-file note: `nla/miles_patches/` ships three `.patch` files. `0001`/
+> `0002` carry the two upstream unlocks below (plus the NLA arg group and
+> assorted fixes). `0003_harmony_loss_mask.patch` adds a `harmony`
+> `--loss-mask-type` to `MultiTurnLossMaskGenerator` for gpt-oss's channel
+> template: prompt = chat-template head + `<|channel|>final<|message|>`
+> (masked — rollouts prefill it under `actor_reasoning_mode=forced_final`),
+> supervised = explanation content + `<|return|>`. All token IDs are derived
+> from the live tokenizer at runtime.
+
 ### 2.1 `--custom-actor-cls-path` — actor class is hardcoded
 
 **`miles/ray/actor_group.py:75-84`**:
@@ -382,7 +391,7 @@ So within the packed stream, each sample's `[..., left_id, inj_id, right_id, ...
 
 ## 6. `nla/` Package Layout
 
-Miles is installed as a separate package (see `docs/setup.md`), not vendored here. The two upstream patches (§2) are applied to the installed `miles` package.
+Miles is installed as a separate package (see `docs/setup.md`), not vendored here. The upstream patches (§2; `0001`–`0003`) are applied to the installed `miles` package.
 
 ```
 natural_language_autoencoders/

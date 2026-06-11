@@ -25,7 +25,8 @@ Goal: two HF checkpoints (`sft_av`, `sft_ar`) + an RL checkpoint with
 `configs/TRAINING_NOTES.md` (Qwen analog: Critic-SL FVE 37.5%, RL 0.752).
 
 **Decisions made with the user:** RunPod for all phases (Stage-2 API on a cheap
-CPU pod); **spot + single 8×H100 node** throughout (RL at the 4/2/2 split);
+CPU pod); **spot + single 8×H100 node** throughout (RL split revised
+2026-06-11 to 4/3/1 — see §Phase-4/5 memory re-derivation);
 **hard stop after Phase −1** — report results + firm cost, then wait for go/no-go
 before any billed (100k datagen / SFT / RL) work. **Overarching principle:
 maximize hands-off operation** — the user makes a few high-leverage decisions and
@@ -45,6 +46,11 @@ Your entire involvement is **four touchpoints**:
    results + firm cost before the billed run).
 4. **Up to two research decisions** *only if* Phase −1 surfaces them (frozen
    experts in −1.0; SGLang fallback in −1.A).
+
+> **Adjustment (2026-06-11):** with the API key staying read-only, pod
+> create/stop becomes an additional manual touchpoint at each pod boundary
+> (~3 create + ~3 stop for the billed run). See §RunPod infrastructure →
+> Orchestration → "Read-only-key adjustment".
 
 After go/no-go, the **deterministic orchestrator** (a script on the always-on
 control pod, **not** Claude-in-the-loop) runs the entire billed pipeline
@@ -245,11 +251,134 @@ control pod `~/phase_minus1_results/`, pod volume `/workspace/logs/`.
   `device_map="cpu"` — never `from_pretrained` the model on a GPU another
   process owns (read tensors via safetensors instead).
 
-**Go/no-go status:** awaiting user. Open items: the two research decisions
-above (−1.0 path, −1.B option), a **read/write** RunPod API key (current key is
-read-only — pods can be listed but not created/stopped via API), and balance
-top-up (was $199.70; billed envelope $1.7–5k at on-demand rates, RL step-time
-still the dominant unknown until the 20-step measurement).
+**Go/no-go status (updated 2026-06-11):** the two research decisions are
+**user-confirmed** — −1.0 = dequantize-to-bf16 (`Mxfp4Config(dequantize=True)`),
+−1.B = `forced_final` (see the decision sections below). Balance top-up:
+promised by the user, not yet landed (was $199.70). RunPod API key: **stays
+read-only for now** (user decision 2026-06-11) — pods can be listed/polled but
+not created/stopped via API, so pod lifecycle is manual; the operating model is
+adjusted accordingly (see §Orchestration → "Read-only-key adjustment").
+RL step-time remains the dominant cost unknown until the 20-step measurement.
+
+---
+
+## MXFP4 actor trainability (−1.0)
+
+**Problem.** ~19B of gpt-oss's 20.9B params are the MXFP4-packed expert MLPs.
+Under the default load they are not trainable, so SFT/RL would update only the
+attention and embedding parameters and leave the experts unchanged. This differs
+from the dense baselines, where all parameters are fine-tuned.
+
+**What −1 tells us.** On hardware: the experts load as `triton_kernels` custom
+tensors (present in neither `named_parameters` nor `named_buffers`), the packed
+MoE forward has no autograd backward, so both experts and router receive zero
+gradient, and 1.8B of 20.9B params are optimizer-visible. Training the experts
+requires dequantizing to bf16 at load. Packed-load peak was 17.3 GiB.
+
+**Decision (user-confirmed 2026-06-11) & why.** Load with `Mxfp4Config(dequantize=True)` at the two training
+load sites, which makes the experts trainable bf16 parameters and matches the
+all-parameter fine-tuning used for the other models. Cost: ~42 GB bf16 weights
+plus optimizer/grad state — see §"Phase-4/5 memory re-derivation" (done
+2026-06-11: ~10 B/param sharded; SFT fits on 8 GPUs, RL split revised to
+4/3/1). OOM ladder: reduce micro-batch, then gradient-checkpointing, then
+offload.
+
+**Alternatives & trade-offs.**
+- **Frozen experts** (default load): no expert gradients, optimizer state, or
+  gradient communication, and experts stay 4-bit, so lower memory and faster
+  steps. Trains attention and embeddings only (router also frozen), which is not
+  comparable to the dense full-fine-tune baselines.
+- **LoRA / partial expert training:** lower memory than full dequantization, at
+  the cost of added adapter machinery and reduced comparability with the dense
+  baselines. A fallback if full dequantization does not fit the 4/2/2 RL split.
+- **Do not train on gpt-oss:** an option if the Phase-4 re-derivation shows RL
+  cannot fit even with the OOM ladder.
+
+## Harmony actor (−1.B)
+
+**Problem.** gpt-oss uses Harmony channels (`analysis` for reasoning, `final` for
+the answer). The `generic` loss-mask assumes the response tokens are contiguous
+immediately after the prompt; the channel control tokens break that assumption,
+so the assert fails and SFT does not start. Separately, the `analysis` channel can
+interfere with `<explanation>` extraction.
+
+**What −1 tells us.** Both issues reproduce. The assert fails on
+`<|channel|>final<|message|>` = `[200005, 17196, 200008]` (close token
+`<|return|>` = 200002). Extraction fails without an adversarial input: an
+`analysis` channel that contains the `<explanation>` string causes the
+whole-string `EXPLANATION_RE` match to return the wrong span.
+
+**Decision (user-confirmed 2026-06-11) & why.** Default to `forced_final`: prefix `<|channel|>final<|message|>`
+onto the generation prompt so the model produces the explanation directly and no
+`analysis` channel is generated. This addresses both issues, is the smallest
+change (~30–60 LOC), and produces an explanation with no reasoning content.
+Implement it as a configurable mode (`actor_reasoning_mode`) so Phase 2 can
+compare it against `free_analysis` on measured FVE. Components: (1) prompt prefix
+`[200005, 17196, 200008]` — the marker stays in the user content
+(`<concept>㎡</concept>` / 83806, confirmed by −1.D); (2) a `harmony` loss-mask
+branch in Miles patch `0001` with close = `<|return|>` (requires an image
+rebuild); (3) harden `extract_explanation` to isolate the final channel before
+matching (in-repo); (4) record the mode in the sidecar and assert data-mode equals
+runtime-mode. Resolve all token IDs from the live tokenizer rather than
+hardcoding, and use the same prompt construction in SFT, RL, and
+`compute_canonical_neighbors`.
+
+**Alternatives & trade-offs.**
+- **`free_analysis`** (the actor may generate an `analysis` channel; the monitor
+  reads only `final`): allows reasoning before the explanation, at ~2–4× RL
+  tokens. The `analysis` channel is unsupervised during SFT. A long `analysis`
+  moves the explanation past `marker_pos + 128`, where the W=128 sliding-window
+  layers no longer attend directly to the marker, which may reduce signal. Use as
+  a Phase-2 comparison arm; assess by bucketing FVE by `analysis` length.
+- **`bounded_analysis`** (cap `analysis` at ~32–64 tokens): retains short
+  reasoning while limiting the sliding-window effect, but requires generation-time
+  length control. Consider only if the smoke shows higher FVE at short `analysis`
+  lengths.
+- **Native two-channel mask / learned suppression** (run options B/C): more
+  implementation, and RL can revert toward emitting `analysis`.
+
+---
+
+## Phase-4/5 memory re-derivation (dequantized bf16 actor, 2026-06-11)
+
+**Basis (read from the patched miles source, not assumed):** FSDP2 stores
+params **bf16** (patch 0001 `torch_dtype=bfloat16`), `MixedPrecisionPolicy
+(param_dtype=bf16, reduce_dtype=fp32)` → sharded grads **fp32**, optimizer is
+plain `torch.optim.AdamW` on the bf16 DTensors → `exp_avg`/`exp_avg_sq`
+allocated **bf16** (`zeros_like(p)`; the patch-0001 comment claiming "Adam
+keeps fp32 master copies" is wrong for torch AdamW on bf16 params). Sharded
+train state ≈ **2 (param) + 4 (grad) + 4 (Adam) = 10 B/param**, split across
+the group's GPUs. Transients on top: ~1.65 GB per-layer bf16 all-gather
+(0.823 B params/layer × 2 B) × prefetch, activations (short sequences,
+micro-batch 1–4), ~4–6 GB CUDA ctx + NCCL.
+
+**Param counts:** actor 20.9 B (≈41.8 GB bf16). Critic (K=17 → 18 layers kept,
+lm_head stripped, + d² value head): 18 × 0.823 B/layer + 0.579 B embed ≈
+**15.4 B** (≈30.9 GB bf16). RL ref model (KL loss, `--ref-load`): +41.8 GB
+bf16, FSDP-sharded over the actor group.
+
+| Phase / group | state | GPUs | GB/GPU | verdict |
+|---|---|---|---|---|
+| SFT actor | 209 GB | 8 | 26.1 | fits (worst-case fp32-Adam 41.8 → still fits) |
+| SFT critic | 154 GB | 8 | 19.3 | fits |
+| RL actor + ref | 209+42 GB | 4 | 62.7 | tight — grad-ckpt on; 52.3 without KL/ref |
+| RL critic @ 4/2/2 | 154 GB | 2 | **77.0** | **effectively OOM** (<3 GB left for transients) |
+| RL critic @ 4/3/1 | 154 GB | 3 | 51.3 | fits |
+| RL rollout, 1 GPU | 41.8 GB wts | 1 | ~42+KV | fits (GQA 8 kv-heads + SWA → small KV; `--sglang-mem-fraction-static ≈ 0.85`) |
+
+**Conclusion: the plan's 4/2/2 RL split fails at the critic.** Default for
+gpt-oss becomes **`ACTOR_GPUS=4 CRITIC_GPUS=3 ROLLOUT_GPUS=1`** (cost: half
+the rollout throughput vs 2 engines — shows up in the 20-step timing).
+Alternative keeping 2 rollout engines: 4/2/2 with `CPUOffloadPolicy` on the
+critic only (miles `fsdp_cpu_offload`; optimizer step on CPU, slower critic
+steps; pod needs ≥~200 GB free host RAM).
+
+**Bring-up gate (same pod session as the 20-step timing):** print actual
+`bytes/param = (param+grad+optim bytes) / N` after step 1. ≈10 B confirms the
+table; ≈16 B (fp32 Adam states — e.g. a miles upstream change) means RL needs
+CPU offload for BOTH trainers regardless of split (actor 334/4 = 83.5 GB/GPU),
+and SFT still fits. OOM ladder unchanged: micro-batch ↓ → gradient
+checkpointing → `fsdp_cpu_offload`.
 
 ---
 
@@ -265,14 +394,17 @@ corrections:
 - **Phase 3 (100k datagen):** if `cache_from` is wired from the smoke outputs,
   Stage 2 is partially cached; otherwise budget the full ~500k Sonnet calls.
 - **Phase 4 (SFT):** single 8×H100 node (`actor_sft.sh`/`critic_sft.sh` are
-  already `--*-num-nodes 1 --*-num-gpus-per-node 8`). Re-derive memory from the
-  −1.0 trainability result. OOM order: drop `--micro-batch-size`, then
-  `--gradient-checkpointing`.
-- **Phase 5 (RL):** single node, **`ACTOR_GPUS=4 CRITIC_GPUS=2 ROLLOUT_GPUS=2`**;
+  already `--*-num-nodes 1 --*-num-gpus-per-node 8`). Memory re-derived for the
+  dequantized bf16 actor — see "Phase-4/5 memory re-derivation" below. SFT fits
+  on 8 GPUs even in the worst (fp32-optimizer) case. OOM order: drop
+  `--micro-batch-size`, then `--gradient-checkpointing`.
+- **Phase 5 (RL):** single node, **`ACTOR_GPUS=4 CRITIC_GPUS=3 ROLLOUT_GPUS=1`**
+  (re-derived 2026-06-11; the original 4/2/2 OOMs at the critic — see
+  §Phase-4/5 memory re-derivation, incl. the 4/2/2+critic-offload alternative);
   `--shm-size=8g` + `NLA_EMBED_DUMP_DIR=/dev/shm/nla`; keep
-  `--sglang-disable-radix-cache` (required). **Measure step-time in the first
-  ~20 steps** and extrapolate to 4000 rollouts before letting it run — MoE
-  step-time is the single largest cost unknown.
+  `--sglang-disable-radix-cache` (required). **Measure bytes/param and
+  step-time in the first ~20 steps** and extrapolate to 4000 rollouts before
+  letting it run — MoE step-time is the single largest cost unknown.
 - **Phase 6.4 (routing eval):** measure routing at the **extraction/AV layer**
   (where expert-collapse would actually hurt the NLA), not only the critic's
   kept blocks as the original plan states.
@@ -346,6 +478,40 @@ to `/data/logs/`, the orchestrator **notifies on completion/failure** (webhook o
 email), and RL resume (`--load` from the volume) caps any preemption loss to ~100
 rollouts.
 
+#### Read-only-key adjustment (2026-06-11)
+
+The user is not providing a read/write RunPod API key for now. The current key
+supports `GET` only (list pods, poll status); it cannot create, stop, or
+terminate pods, so the orchestrator **cannot provision or tear down pods**.
+Adjusted model:
+
+- **Pod lifecycle is manual.** At each pod boundary the orchestrator (or
+  Claude, interactively) sends an ntfy notification containing the exact pod
+  spec to deploy (GPU type/count, image, network volume, `--shm-size`, spot vs
+  on-demand) and the user creates/stops the pod in the RunPod console.
+  Everything *inside* a pod stays fully automated (`tmux` + phase script + ntfy
+  on completion/failure), and progress monitoring still works via the
+  read-only key.
+- **Pack phases to minimize touchpoints.** Three pod sessions instead of five:
+  (1) 8×H100 — Stage 0 + Stage 1; (2) CPU — Stage 2 + Stage 3 (+ shuffle);
+  (3) 8×H100 — SFT → RL 20-step measurement → (cost check) → RL → eval,
+  chained in one script. ≈3 create + ≈3 stop actions for the whole billed run.
+- **Idle-billing risk shifts to the user**: a finished phase bills until the
+  pod is stopped. Mitigations: the completion notification fires immediately;
+  **verify on the next pod** whether `runpodctl stop pod $RUNPOD_POD_ID` works
+  from inside the pod with whatever pod-scoped credentials RunPod injects — if
+  it does, every phase script ends with self-stop and the idle risk disappears
+  (only *creation* stays manual). Until verified, assume manual stop.
+- **Spot auto-resume is gone.** The orchestrator can't recreate a preempted
+  pod. For the multi-day RL run either (a) accept manual
+  recreate-on-preemption (ntfy → user recreates the pod, `--load` resumes from
+  the volume, ≤100 rollouts lost), or (b) run RL **on-demand** (+~50–80% on
+  that line only) to remove preemption babysitting entirely. Recommendation:
+  spot for the short pods (Stage 0, SFT), decide spot-vs-on-demand for RL at
+  the 20-step cost checkpoint.
+- The control pod keeps the read-only key for monitoring only; no write
+  credential is stored anywhere.
+
 The control pod is **disposable and reproducible**: a `bootstrap.sh` (in a
 private config repo) installs Claude (optional), sets the auth token, clones the
 NLA repo, and copies `~/.claude/CLAUDE.md` — so moving/recreating it is a few
@@ -371,7 +537,7 @@ larger CPU pod for that single step rather than oversizing the always-on pod.
 5. **Phase 4 SFT:** 8×H100 spot pod; `prepare_critic_checkpoint`; run
    `actor_sft.sh` + `critic_sft.sh`; watch logs for the CJK injection-failure
    smell; **stop.**
-6. **Phase 5 RL:** 8×H100 spot pod, `--shm-size=8g`, 4/2/2 split, in tmux,
+6. **Phase 5 RL:** 8×H100 spot pod, `--shm-size=8g`, 4/3/1 split, in tmux,
    `… 2>&1 | tee /data/logs/rl.log`. Spot preemption mitigated by
    `SAVE_INTERVAL=100` + `--load` resume from volume. Measure step-time first;
    stop ~4000 rollouts.
@@ -426,9 +592,10 @@ change and it's one crash from gone.
 
 ## What I need from you
 
-- **RunPod API key (read/write)** — Settings → API Keys. Drives REST v1 /
-  `runpodctl` provisioning and the control-pod orchestrator. Store as a RunPod
-  secret on the control pod; revoke after the run.
+- ~~**RunPod API key (read/write)**~~ — **declined for now (2026-06-11)**: the
+  key stays read-only, pod lifecycle is manual via the console (see
+  "Read-only-key adjustment"). Revisit only if manual pod create/stop becomes
+  a bottleneck.
 - **A Secure-Cloud DC that has both 8×H100 and network volumes** — confirm in the
   deploy UI (capacity fluctuates; check 1×H100 for Phase −1 and 8×H100 single-node
   for the rest). The network volume is created in that same DC. Accept on-demand
@@ -443,10 +610,9 @@ change and it's one crash from gone.
 - **Rotate the exposed keys in repo-root `.env`** (`ANTHROPIC_/OPENAI_/
   OPENROUTER_/GEMINI_`, incl. the plaintext `sk-ant-…`) and confirm `.env` is
   gitignored — anything that touched a commit or shared pod is burned.
-- **Two research decisions** that may come back from Phase −1: how to handle
-  frozen experts if −1.0 finds them (train-attn-only vs dequant-to-trainable vs
-  abort), and the SGLang fallback if −1.A fails (write a `gpt_oss` patch vs
-  HF-generate at ~5× slowdown).
+- ~~**Two research decisions**~~ — **resolved (user-confirmed 2026-06-11)**:
+  −1.0 → dequantize-to-bf16 at the training load sites; −1.B → `forced_final`
+  Harmony mode (−1.A passed, no SGLang fallback needed).
 
 I can produce the Dockerfiles, the RunPod pod templates, the control-pod
 orchestrator, the Phase −1 diagnostic scripts, and the Phase-6 eval driver; you

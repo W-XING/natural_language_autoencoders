@@ -8,9 +8,10 @@
   No private/internal dependencies.
 - **Miles is upstream, not ours.** Don't edit the installed `miles` package —
   extend via subclassing (`NLAFSDPActor`) and the `--*-path` function-pointer
-  args. The two upstream patches we depend on (`--custom-actor-cls-path`,
-  `--force-use-critic`) live as `.patch` files in `nla/miles_patches/`
-  (`0001`/`0002` + `UPSTREAM_PIN` version pin), applied to the installed
+  args. The upstream patches we depend on live as `.patch` files in
+  `nla/miles_patches/` (`0001`/`0002` for `--custom-actor-cls-path` +
+  `--force-use-critic`, `0003` for the `harmony` loss-mask branch (gpt-oss
+  forced_final), + `UPSTREAM_PIN` version pin), applied to the installed
   package — not vendored here. They're documented in `docs/design.md` §2.
 - Miles uses argparse; match that for CLIs in `nla/`.
 - **Two training backends.** FSDP (`nla/train_actor.py`, primary) and Megatron
