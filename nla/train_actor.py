@@ -446,6 +446,26 @@ class NLAFSDPActor(FSDPTrainRayActor):
                     f"--actor-reasoning-mode forced_final or drop the harmony mask."
                 )
 
+        # gpt-oss sink-attention FA2 (hub `kernels` path) is NON-CAUSAL under
+        # miles' packed calling convention (attention_mask=None + per-sample
+        # position_ids): measured 2026-06-12 — packed per-sample NLL 0.02-0.05
+        # incl. pack position 0 vs 5.0+ standalone, i.e. tokens attend to their
+        # own future. Training silently degenerates into copy-forward. Eager
+        # routes through transformers' position-id block-diagonal detection and
+        # measures causal-correct. Refuse to train gpt-oss on anything else.
+        model_type = getattr(getattr(self, "hf_config", None), "model_type", None)
+        if model_type is None:
+            from transformers import AutoConfig
+            model_type = AutoConfig.from_pretrained(
+                args.hf_checkpoint, trust_remote_code=True).model_type
+        if model_type == "gpt_oss":
+            assert self.args.attn_implementation == "eager", (
+                f"gpt_oss training requires --attn-implementation eager: the "
+                f"sink-attention FA2 kernels are non-causal under packed "
+                f"sequences (attention_mask=None), which silently invalidates "
+                f"training. Got {self.args.attn_implementation!r}."
+            )
+
         self._nla_cfg: NLAConfig = cfg
         self._nla_vectors: torch.Tensor | None = None
         # Expose mse_scale on args so nla_critic_loss can read it backend-agnostically.
