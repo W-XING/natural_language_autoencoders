@@ -129,6 +129,14 @@ class HFExtractor(ActivationExtractor):
                 truncation=True,
                 max_length=self.max_length,
                 add_special_tokens=True,
+                # Web corpora contain literal special-token strings (e.g. a
+                # ufw_en doc with "<|endoftext|>" in its body). Without this
+                # flag the tokenizer parses them into special IDs: the
+                # pad-in-token_ids assert in stage0 false-positives whenever
+                # the parsed ID == pad_token_id, and a mid-document EOT
+                # corrupts left-context semantics. Encode them as the literal
+                # characters instead (tiktoken disallowed_special semantics).
+                split_special_tokens=True,
             )
             device = self.model.get_input_embeddings().weight.device
             input_ids = enc["input_ids"].to(device)
