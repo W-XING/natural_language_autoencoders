@@ -66,6 +66,16 @@ free-associates Chinese. Grep generated text for CJK — that's the loudest
 smoke test for the entire injection path. See `docs/inference.md`
 § "Debugging: injection-failure smell" for the cause checklist.
 
+- **gpt-oss trains with `--attn-implementation eager` ONLY** (asserted in
+  `NLAFSDPActor.__init__`). The sink-attention FA2 hub kernels are NON-CAUSAL
+  under miles' packed convention (`attention_mask=None` + per-sample
+  `position_ids`): tokens attend to their own future and SFT loss collapses
+  to ~0 by copy-forward while learning nothing (caught by the Phase-2 smoke,
+  2026-06-12). Diagnostic signature: train loss ≪ teacher-forced NLL of the
+  saved checkpoint on the SAME rows in a single-sequence forward. Confirm by
+  comparing packed vs standalone per-sample NLL — pack position 0 differing
+  from standalone is impossible under causal attention.
+
 ## Where to look
 
 - `docs/design.md` — architecture, Miles integration, the two upstream
