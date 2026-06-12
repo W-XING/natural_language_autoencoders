@@ -13,9 +13,14 @@ layer_index: 17  # see gpt_oss_20b_ultrafineweb_1k.yaml
 output_dir: /tmp/nla_gpt_oss_20b_ultrafineweb_100k
 
 corpus:
-  name: openbmb/Ultra-FineWeb   # see qwen7b_ultrafineweb_100k.yaml header re: dataset size
+  # Local single-file slice of openbmb/Ultra-FineWeb en (part-0001-of-2048,
+  # 566,021 docs). The canonical hub dataset is multi-TB and stage0 loads
+  # non-streaming — never point name: at the hub repo. doc_id embeds this
+  # path, and the 1k smoke (2026-06-11) used it: keep it IDENTICAL so
+  # per-doc keyed RNG and stage2 cache_from line up across runs.
+  name: /workspace/data/ufw_en_slice
   config: null
-  split: en
+  split: train
   text_column: content
   start: 0
   length: 100000
@@ -33,13 +38,20 @@ stage1:
   seed: 42
 
 stage2:
-  provider_cls: nla.datagen.providers.AnthropicProvider
+  # Decision 2026-06-12: Message Batches API (50% of standard prices).
+  # Measured on the 1k smoke: 836 input + 126 output tokens/call mean
+  # -> ~500k calls ~= $1,100 batch (vs $2,200 standard). Prompt caching is
+  # NOT viable: the fixed instruction prefix is 372 tokens, below Sonnet
+  # 4.6's 2,048-token cacheable minimum.
+  provider_cls: nla.datagen.providers.AnthropicBatchProvider
   provider_kwargs:
     model: claude-sonnet-4-6
     max_tokens: 300
     temperature: 1.0
-    concurrency: 100
   chunk_size: 65536
+  cache_from:
+    - /workspace/data/nla_gpt_oss_20b_1k/splits/av_sft_explained.parquet
+    - /workspace/data/nla_gpt_oss_20b_1k/splits/ar_sft_explained.parquet
 
 stage3:
   keep_debug_metadata: true

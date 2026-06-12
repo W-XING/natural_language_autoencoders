@@ -554,7 +554,7 @@ we fall to on-demand for a pod, that line rises ~50–80%.
 |---|---|---|
 | **−1/0 + 1k smoke (interactive, ~1 day if green; 2–4 days if fixes needed)** | 1×H100 ~8–12 active h | $30–60 |
 | 100k extract | 8×H100 ~2–4h | $60–130 |
-| Stage 2 (API, no GPU) | CPU pod | API **$150–400** + ~$5 |
+| Stage 2 (API, no GPU) | CPU pod | API **~$1,100** (see correction below) + ~$5 |
 | SFT (AV+AR) | 8×H100 ~4–10h | $90–280 |
 | **RL → 4000 rollouts** | 8×H100, **step-time TBD** | **$1,100–3,200** |
 | Storage 1TB + control pod | run-days | $50–160 |
@@ -563,6 +563,26 @@ we fall to on-demand for a pod, that line rises ~50–80%.
 unknown — retired by the ~20-step measurement before the full RL run (~$10 of
 H100 to de-risk thousands). On-demand-fallback worst case pushes total toward
 ~$6–7k.
+
+### Stage-2 cost correction + decision (2026-06-12, measured on the 1k smoke)
+
+The plan's original **$150–400** Stage-2 line was wrong. Measured on the
+completed 1k smoke (`count_tokens` on real prompts; real explanation lengths):
+**836 input + 126 output tokens/call mean** → ~500k Sonnet 4.6 calls =
+**$2,200 standard** ($3/$15 per Mtok). Prompt caching is not applicable: the
+fixed instruction prefix is 372 tokens, under Sonnet 4.6's 2,048-token
+cacheable minimum. **User decision: Message Batches API (−50%) → ~$1,100.**
+Implemented as `nla.datagen.providers.AnthropicBatchProvider` (same
+`complete()` contract and drop semantics; errored/expired requests retried in
+follow-up batches), wired into
+`configs/datagen/gpt_oss_20b_ultrafineweb_100k.yaml` together with
+`cache_from` pointing at the smoke's `*_explained.parquet` (~1% free reuse).
+GPT-5.5 was considered and rejected: $5/$30 per Mtok (≥2× Sonnet) plus
+reasoning tokens billed as output, and it would break explainer-model
+comparability with the shipped Qwen/Gemma/Llama datasets. Haiku 4.5 batch
+(~$367) remains the cheaper fallback if budget demands it, gated on a quality
+comparison. Wall-clock: each 65,536-prompt chunk is one batch round, usually
+<1 h; ~8 chunks across av+ar → same-day completion on the CPU pod.
 
 ---
 
