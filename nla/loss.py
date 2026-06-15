@@ -74,14 +74,19 @@ def nla_critic_loss(args, parallel_state, batch, values, sum_of_sample_mean):
     pred = values_flat[last_idx]
 
     gold = gold.to(pred.device)
-    # With mse_scale = sqrt(d): (s²/d)|p̂-ĝ|² = |p̂-ĝ|² (s cancels via mean).
-    # ∂loss/∂pred is tangent-sphere (⊥ pred) — norm-neutral to first order.
-    # But ∂loss/∂W isn't: weight-space steps incidentally grow |pred| at
-    # ~lr·sign(g) rate (Adam scale-invariance). See training notes — backbone
-    # norm grows ~linearly with steps. Mitigation: lower lr or add norm term.
+    # Compute the normalize+MSE path in fp32, NOT the backbone's bf16. The
+    # direction-only loss divides by |pred| (normalize_activation), whose
+    # BACKWARD carries a 1/|pred| factor — for an outlier sample with a small
+    # predicted norm that gradient overflows bf16 → NaN, which the optimizer
+    # then writes into the weights → the next forward's backbone_last_hidden
+    # is NaN. (Observed on gpt-oss: finite through step 6, sudden NaN at
+    # step 7, with grad-clip=1.0 already on — clipping can't rescue an
+    # already-NaN gradient.) fp32's dynamic range keeps that gradient finite;
+    # the well-scaled gradient is cast back to bf16 for the backbone backward.
+    # See loss.py history + docstring "backbone norm grows ~linearly".
     loss_per_sample = F.mse_loss(
-        normalize_activation(pred, mse_scale),
-        normalize_activation(gold, mse_scale),
+        normalize_activation(pred.float(), mse_scale),
+        normalize_activation(gold.float(), mse_scale),
         reduction="none",
     ).mean(dim=-1)
 
