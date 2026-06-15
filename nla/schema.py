@@ -217,10 +217,22 @@ def normalize_activation(v: torch.Tensor, target_scale: float | None) -> torch.T
     target_scale=None → no-op pass-through for either purpose.
     Idempotent. Zero vectors stay zero. Norm computed in fp32 for precision;
     single division v / (||v||_fp32 / scale).
+
+    The floor is RELATIVE (target_scale * 1e-3), not an absolute 1e-12. An
+    absolute floor is a gradient bomb in the critic backward: for a near-zero
+    pred the scaling factor is scale/||v||, and its gradient is the same
+    scale/floor — at floor=1e-12, scale≈53.7 that's ~5e13, which overflows
+    bf16 → NaN gradient → NaN weights (observed: gpt-oss critic SFT grad_norm
+    spiked to 2.7e11 at step 5, NaN at step 6, before grad-clip could act).
+    A relative floor bounds the worst-case gradient at scale/(scale*1e-3)=1e3.
+    For all non-degenerate vectors (||v|| >> floor — e.g. activations ~5500,
+    actor injection) this is byte-identical to the old behaviour; only truly
+    near-zero predictions are clamped, and those are degenerate anyway.
     """
     if target_scale is None:
         return v
-    norm_fp32 = v.float().norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    floor = target_scale * 1e-3
+    norm_fp32 = v.float().norm(dim=-1, keepdim=True).clamp_min(floor)
     return v / (norm_fp32 / target_scale).to(v.dtype)
 
 

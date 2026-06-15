@@ -74,16 +74,14 @@ def nla_critic_loss(args, parallel_state, batch, values, sum_of_sample_mean):
     pred = values_flat[last_idx]
 
     gold = gold.to(pred.device)
-    # Compute the normalize+MSE path in fp32, NOT the backbone's bf16. The
-    # direction-only loss divides by |pred| (normalize_activation), whose
-    # BACKWARD carries a 1/|pred| factor — for an outlier sample with a small
-    # predicted norm that gradient overflows bf16 → NaN, which the optimizer
-    # then writes into the weights → the next forward's backbone_last_hidden
-    # is NaN. (Observed on gpt-oss: finite through step 6, sudden NaN at
-    # step 7, with grad-clip=1.0 already on — clipping can't rescue an
-    # already-NaN gradient.) fp32's dynamic range keeps that gradient finite;
-    # the well-scaled gradient is cast back to bf16 for the backbone backward.
-    # See loss.py history + docstring "backbone norm grows ~linearly".
+    # Compute in fp32 (defensive — _train_step already .float()'s values, so
+    # this is usually a no-op, but keeps the path fp32 if that ever changes).
+    # The actual NaN root-cause fix lives in normalize_activation's RELATIVE
+    # gradient floor: the direction-only loss divides by |pred|, whose backward
+    # scaling is bounded by scale/floor — an absolute 1e-12 floor made that
+    # ~5e13 and overflowed for a near-zero-norm outlier pred (gpt-oss critic
+    # SFT: grad_norm 2.7e11 at step 5 → NaN at step 6, grad-clip can't rescue
+    # an already-NaN gradient). See normalize_activation docstring.
     loss_per_sample = F.mse_loss(
         normalize_activation(pred.float(), mse_scale),
         normalize_activation(gold.float(), mse_scale),
