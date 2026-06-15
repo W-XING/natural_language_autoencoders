@@ -178,16 +178,38 @@ NaN.
    `~lr·sign(g)` norm-growth rate, the chronic driver. (The Qwen-7B critic was
    stable at 2e-5 because its layer-20 activations are far smaller than
    gpt-oss's layer-17 ~5350-norm residual stream.)
-**Result.** Post-warmup (step 94): `pred_norm_raw` equilibrated ~6150 (stable,
-not runaway), FVE climbing −1.14 → −0.05 (about to cross 0 into beating
-predict-the-mean), non-finite-skip rate a steady ~20 % minority. Committed
-(patch `0004`, `normalize_activation` floor, plotter FVE/norm curves); memory
-`critic-nan-normalize-floor`. **Caveat carried forward:** the ~20 % dropped
-batches are an inherent gpt-oss bf16-backward property, not LR-dependent; if
-final FVE lands materially below the Qwen baseline (Critic-SL 37.5 %), the
-principled remedy is a loss-level norm-anchoring term (penalise `|pred|`
-deviating from `|gold|`) — a critic-objective change with FVE-comparability
-implications, to be raised as a research decision, not applied silently.
+**Result of skip-guard + lr-halving (INSUFFICIENT).** It climbed cleanly to
+peak **FVE ≈ 0.32** (step 539–570) but `pred_norm_raw` never stopped drifting
+up (6150 → 7060 → …). At **step 592 the weights NaN'd irrecoverably** — not the
+earlier intermittent skip (which the guard handles), but a permanent cascade:
+once `pred_norm`/the L17 residual stream drifted into the bf16-overflow regime,
+a *forward* overflowed → NaN weights, and the skip-guard cannot un-poison
+weights (it only blocks new NaN-grad updates). Steps 592–967 were all NaN
+(~87 % skip in the tail). Compounding operator error: the `ckpt_janitor.sh`
+keep-1 retention (set for the *stable* actor run) pruned the finite-FVE
+`iter_200/400` saves, leaving only the NaN `iter_967` → **no usable critic
+checkpoint, full rerun required.** Lessons: (i) keep-1 retention is unsafe on a
+run with known instability — keep periodic + best; (ii) `clip_grad_norm_` +
+non-finite-grad-skip is necessary but NOT sufficient — they don't stop the
+chronic magnitude runaway that eventually overflows the forward.
+
+**Decision (user, 2026-06-15): Option A — add the norm-anchor term.** The
+direction-only MSE is magnitude-invariant, so nothing bounds `|pred|`; the fix
+is the docstring's other prescription. Added
+`λ·((|pred|-|gold|)/|gold|)²` to `nla_critic_loss` (λ from env
+`NLA_CRITIC_NORM_ANCHOR`, default 0.5). Its gradient is purely RADIAL,
+orthogonal to the direction-MSE's tangential gradient, so it pins magnitude
+without fighting the direction learning FVE measures. This keeps `|pred|` ≈
+`|gold|` (~5300), holding the backbone activations out of the bf16-overflow
+regime — addressing the *root* cause, not just the symptom. **Trade-off
+(accepted):** the objective is no longer pure direction-only MSE, so the
+resulting FVE is not strictly apples-to-apples with the Qwen/Gemma/Llama
+baselines (which used λ=0); set λ=0 to recover the exact historical objective.
+Rerun also switches the janitor to keep-2 + best and adds a NaN watchdog
+(kill on sustained non-finite loss) so compute isn't wasted and a good
+checkpoint always survives. patch `0004` (skip-guard) and the
+`normalize_activation` relative floor are retained as defensive depth. Memory
+`critic-nan-normalize-floor` updated.
 
 ---
 
