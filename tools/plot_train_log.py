@@ -48,6 +48,9 @@ _GROUPS = {
     "train/lr-pg_0": ("lr", "learning rate", False),
     "rollout/rewards": ("reward", "rollout reward", False),
     "rollout/raw_reward": ("reward", "rollout reward", False),
+    "train/fve_nrm": ("fve", "FVE (normalized)", False),
+    "train/pred_norm_raw": ("norms", "raw L2 norm", False),
+    "train/gold_norm_raw": ("norms", "raw L2 norm", False),
     "rollout/response_lengths": ("response_len", "response length (tokens)", False),
     "perf/step_time": ("step_time", "step time (s)", False),
 }
