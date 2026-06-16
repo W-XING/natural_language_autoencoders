@@ -211,6 +211,37 @@ checkpoint always survives. patch `0004` (skip-guard) and the
 `normalize_activation` relative floor are retained as defensive depth. Memory
 `critic-nan-normalize-floor` updated.
 
+**OUTCOME — Option A was NECESSARY but NOT sufficient; it disproved the
+magnitude hypothesis (2026-06-16).** With the norm-anchor on, `pred_norm` was
+pinned to `|gold|` ~5300 *the entire run* (anchor working perfectly) — yet the
+critic still NaN'd, and **earlier, at step 87**. That ruled out the
+magnitude-runaway / forward-overflow story (the forward was stable, loss flat
+~0.29 throughout). The `grad_norm` trace told the real story: it oscillated
+**0.2 ↔ 24960 ↔ 1.99e9 ↔ 1.67e17 ↔ 1.82e19 ↔ NaN**, bimodally, from ~step 60 —
+i.e. the gpt-oss critic's **eager bf16 BACKWARD produces garbage gradients on
+~half the batches**, independent of the forward or `|pred|` (the explosion
+concentrates in attention `q_proj` + the sink term). `clip_grad_norm_` rescaled
+the huge-but-FINITE ones to norm 1.0 and *stepped* them, which slowly poisoned
+the Adam moments → permanent NaN.
+
+**REAL FIX — discard the bad-gradient batches (patch 0004 extended).** Change
+the skip condition from "non-finite grad_norm" to **"non-finite OR grad_norm >
+`NLA_GRAD_SKIP_THRESHOLD` (default 1000)"** (healthy grad_norm ~4, step-0
+transient ~118, explosions 1e4+). This *discards* the garbage batches entirely
+instead of clipping+stepping them, so Adam is never poisoned. Retained the
+norm-anchor (λ=0.5, correctly stabilizes magnitude — harmless) + lr 1e-5.
+**Result: a full clean epoch, final FVE 0.360 (≈ Qwen baseline 0.375)**, zero
+NaN, zero watchdog fires — at the cost of ~45 % of batches skipped (an inherent
+property of the gpt-oss eager bf16 backward, not LR-dependent). The skip rate
+caps data efficiency but the surviving ~55 % was enough to match the baseline.
+The heavier alternative that would recover the skipped batches — **fp32 critic
+backbone** (run the unstable MoE backward in fp32) — was kept in reserve and
+not needed. A **dense-critic re-init** (collapse the MoE → a dense MLP,
+intermediate = expert_dim × top-k = 11,520, no router) was considered and
+**rejected**: the MoE is an input-dependent top-4-of-32 routed mixture that no
+fixed dense MLP can reproduce, so there is no function-preserving init — it
+would be a distillation project, not an initialization.
+
 ---
 
 ## C. Infrastructure
@@ -227,6 +258,35 @@ save-interval-100 × 4000-rollout schedule would have blown it regardless.
 `iter_*` dirs every 120 s; deleted redundant DCP train-state once the HF
 export existed, plus the smoke HF dir. A volume resize to 1 TB was the cleaner
 option but was declined (shared-infra mutation gate); janitor keep-N suffices.
+
+**Recurrence + final fix (2026-06-16).** It crashed AGAIN on the critic rerun's
+`iter_400` save — this time because the janitor had been set to **keep-2-full**
+(safer for an unstable run) but a *full* critic checkpoint is ~115 GB
+(`hf` 29 GB + DCP `model/` ~31 GB + **fp32 Adam `optimizer/` ~55 GB**), so two
+of them plus the in-flight third's transient overflowed the 500 GB volume
+(~509 GB peak). The training was healthy (FVE 0.25, climbing) — only the save
+died. **Final janitor = keep-1-full only** (delete all older iters; the newest
+is best since FVE climbs monotonically once stable), bounding peak to ~1 full +
+1 in-flight full ≈ 451 GB. Lesson: account for the fp32-optimizer DCP (≈2×
+params) in checkpoint budgeting, not just the bf16 weights.
+
+### C1b. hf-export `value_head.safetensors` corrupted (DCP is the source of truth)
+**Symptom.** The completed critic's final `iter_0000967/hf/value_head.safetensors`
+had **11,880 NaN + 93 inf of 8.29 M elements (~0.14 %)** — even though step-966
+logged a finite FVE 0.360 (computed *from* the value head) and the backbone
+shards were fully finite. The earlier run#3 checkpoint's `hf` value_head was
+likewise non-finite.
+**Cause.** The convenience `hf/` export in `NLAFSDPActor.save_model`
+(`get_model_state_dict(full_state_dict=True, cpu_offload=True)` gather) corrupts
+a sliver of the `value_head` on save. It is NOT a training problem — the FSDP
+**DCP** `model/value_head.weight` is **100 % finite** (the DCP is written by the
+parent's normal checkpoint path, not the NLA gather).
+**Fix.** Repair the hf export by copying `value_head` from the DCP: load
+`iter_*/model` via `convert_fsdp_to_hf`'s `WrappedStorageReader`, extract
+`...value_head.weight` (finite), overwrite `hf/value_head.safetensors`. Verified
+the repaired critic loads and predicts finite vectors in the right norm range
+(~5400–5700 ≈ gold). **TODO (code, low priority):** fix the `save_model`
+value_head gather so the hf export isn't corrupted in the first place.
 
 ### C2. Training environment did not exist on the volume venv
 **Symptom.** `import miles / sglang / flash_attn` all failed in the volume's
@@ -281,11 +341,22 @@ just conservative on memorised rows.
 
 ---
 
+## Outcome (2026-06-16)
+Both SFT halves complete and validated on gpt-oss-20b: **actor SFT** held-out
+real-vs-random gap **0.378** nats (0 % CJK); **critic SFT** final **FVE 0.360**
+(≈ Qwen baseline 0.375). Checkpoints on the volume: actor `av_sft_100k_hf`,
+critic `critic_sft_100k/iter_0000967` (hf value_head repaired from DCP). RL is
+the next phase, gated on the user (memory `stop-before-rl-directive`).
+
 ## Commit trail (branch `gpt-oss-20b`)
 - `dcdcb39` stage0 `split_special_tokens=True` (A2)
 - `e94c691` `AnthropicBatchProvider` + 100k yaml batch/slice/cache_from (A3)
 - eager-attention assert + CLAUDE.md (B1)
 - `normalize_activation` relative floor + critic-loss fp32 (B2 defensive)
-- `0004_skip_nonfinite_grad.patch` (B2 real fix)
-- `plot_train_log` + FVE/norm curves (tooling)
-</content>
+- norm-anchor term in `nla_critic_loss` (B2, Option A — necessary, insufficient)
+- `0004_skip_nonfinite_grad.patch` — extended to skip on grad_norm > threshold,
+  the REAL critic fix (B2)
+- `plot_train_log` + FVE/norm curves; committed run plots `nla/notes/plots/`
+- janitor keep-1-full + DCP-sourced value_head repair are operational
+  (`/workspace/*.sh` on the pod), not repo code — see C1/C1b
+
