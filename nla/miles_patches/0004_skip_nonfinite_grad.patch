@@ -1,22 +1,19 @@
-Skip the FSDP optimizer step on a non-finite global grad_norm.
+Skip the FSDP optimizer step on a non-finite OR explosively-large global grad_norm.
 
-Applies AFTER 0001/0002/0003 (line numbers are relative to the
-0001-0003-patched miles tree at UPSTREAM_PIN). gpt-oss critic SFT exposed
-this: the direction-only critic MSE feeds a tiny gradient into the gpt-oss
-backbone, whose bf16 backward (attention q_proj + sinks) intermittently
-amplifies it to a huge/NaN value as the backbone norm drifts up during
-training (the "backbone norm grows ~linearly" instability documented in
-nla/loss.py). clip_grad_norm_ cannot rescue an already-NaN gradient — it
-multiplies every grad by clip/nan = nan — so without this guard the optimizer
-writes NaN into the weights and every subsequent forward is NaN (observed:
-clean through step 4-6, grad spike ~2.7e11, NaN cascade from step 7).
-
-grad_norm here is the all-reduced GLOBAL value (.full_tensor().item()), so
-every rank evaluates math.isfinite() identically and takes the same branch —
-no rank divergence. On a skip, the loop-top self.optimizer.zero_grad() of the
-next step clears the poisoned gradient. Healthy batches step normally; only
-the rare pathological batch is dropped (observed ~4/19 early, FVE still
-climbing -1.14 -> -0.17).
+Applies AFTER 0001/0002/0003 (line numbers relative to the 0001-0003-patched
+miles tree at UPSTREAM_PIN). The gpt-oss critic's eager bf16 backward
+(attention sinks + q_proj) intermittently produces GARBAGE gradients on ~half
+the batches — non-finite (NaN/inf) or explosively large (observed global
+grad_norm 1e9-1e19, while healthy steps are ~0.2-4). clip_grad_norm_ cannot
+help: a NaN makes the whole clip NaN, and a huge-finite norm gets rescaled to
+1.0 and STEPPED, which slowly poisons the Adam moments until a permanent NaN
+(first 100k critic run: NaN at step 592; norm-anchor rerun: NaN at step 87,
+pred_norm perfectly stable the whole time -> the failure is the backward, not
+the magnitude). Discard those batches entirely. grad_norm is the all-reduced
+GLOBAL value, so every rank takes the same branch (no divergence); the loop-top
+self.optimizer.zero_grad() of the next step clears the poisoned gradient.
+Threshold from env NLA_GRAD_SKIP_THRESHOLD (default 1000; healthy grad_norm is
+~4, step-0 transient ~118, explosions 1e4+). Healthy batches step normally.
 
 --- a/miles/backends/fsdp_utils/actor.py
 +++ b/miles/backends/fsdp_utils/actor.py
@@ -26,24 +23,28 @@ climbing -1.14 -> -0.17).
  import os
  import random
  from argparse import Namespace
-@@ -471,8 +489,19 @@ class FSDPTrainRayActor(TrainRayActor):
+@@ -471,8 +489,24 @@ class FSDPTrainRayActor(TrainRayActor):
                  grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
                  grad_norm = grad_norm.full_tensor().item()
 
 -                self.optimizer.step()
 -                self.lr_scheduler.step()
-+                # [NLA patch 0004] skip the optimizer step on a non-finite global
-+                # grad_norm instead of writing NaN/inf into the weights (which
-+                # poisons every later forward). grad_norm is the all-reduced
-+                # global value, so all ranks take the same branch. The next
-+                # step zeroes grads at the loop top, clearing the poisoned grad.
-+                if math.isfinite(grad_norm):
++                # [NLA patch 0004] skip the optimizer step when the global
++                # grad_norm is non-finite OR explosively large. gpt-oss critic
++                # eager backward intermittently produces garbage gradients
++                # (norm 1e9-1e19 or NaN) on ~half the batches; norm-clip rescales
++                # the huge-finite ones to 1.0 and steps them, which poisons Adam
++                # over time -> permanent NaN. Discard those batches entirely
++                # (the next step zeroes grads at the loop top). grad_norm is the
++                # all-reduced global value, so all ranks take the same branch.
++                _grad_skip_thresh = float(os.environ.get("NLA_GRAD_SKIP_THRESHOLD", "1000.0"))
++                if math.isfinite(grad_norm) and grad_norm <= _grad_skip_thresh:
 +                    self.optimizer.step()
 +                    self.lr_scheduler.step()
 +                else:
 +                    logging.getLogger(__name__).warning(
 +                        f"[NLA patch 0004] skip optimizer step rollout={rollout_id} "
-+                        f"step={step_id}: non-finite grad_norm={grad_norm}"
++                        f"step={step_id}: grad_norm={grad_norm} (thresh={_grad_skip_thresh})"
 +                    )
 
                  if self.args.ci_test:
