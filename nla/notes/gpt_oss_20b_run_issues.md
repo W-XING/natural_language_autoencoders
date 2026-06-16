@@ -107,7 +107,8 @@ right-context, so next-token prediction collapses to copy-forward and the
 **Diagnosis (how it was isolated).** Eliminated in order: (1) eval/train token
 layout — `MultiTurnLossMaskGenerator(tok,"harmony").get_loss_mask` output was
 byte-identical to the eval harness's `gen_prompt + prefix + resp + close`
-(297 tokens, 130 supervised); (2) DCP→HF conversion — converted tensors
+(297 tokens, 130 supervised); (2) Distributed Checkpoint (DCP, PyTorch's
+`torch.distributed.checkpoint` sharded format)→HF conversion — converted tensors
 differed from base by max 1.7e-3 (i.e. genuinely trained, not a load bug),
 and DCP↔converted diff was 0.0; (3) stale saves — `iter_0000180` vs
 `iter_0000189` embeddings differed by 1.4e-4 (weights evolving); (4)
