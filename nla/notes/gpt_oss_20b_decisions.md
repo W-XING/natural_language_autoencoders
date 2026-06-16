@@ -97,7 +97,7 @@ unaffected. See run-issues §B1.
 **Why.** The first 100k critic run reached peak FVE 0.32 then NaN'd
 irrecoverably at step 592: direction-only MSE is magnitude-invariant, so Adam's
 scale-invariance grows `|pred|` ~lr·sign(g)/step until the L17 residual stream
-overflows bf16 in the forward. The skip-guard (R-eng patch 0004) + lr-halving
+overflows bf16 in the forward. The non-finite-gradient skip (R-eng patch 0004) + lr-halving
 only delayed it. The anchor's gradient is purely RADIAL (⊥ the direction-MSE's
 tangential gradient) → pins `|pred|` ≈ `|gold|` (~5300), holding activations out
 of the overflow regime. Root-cause fix, per the loss docstring's "add norm

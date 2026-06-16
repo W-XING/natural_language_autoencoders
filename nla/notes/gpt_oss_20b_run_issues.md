@@ -171,19 +171,19 @@ NaN.
    else log-and-skip. `grad_norm` there is the all-reduced **global** value,
    so every rank takes the same branch (no divergence); the loop-top
    `optimizer.zero_grad(set_to_none=True)` of the next step clears the poisoned
-   gradient. Healthy batches step normally; only the rare non-finite batch is
+   gradient. Batches with a finite gradient step normally; only the rare non-finite batch is
    dropped. Live on the pod's editable miles; `.patch` recorded for the image
    rebuild (applies after 0001–0003).
 2. **Lower critic LR 2e-5 → 1e-5, warmup 50 → 100** — halves the documented
    `~lr·sign(g)` norm-growth rate, the chronic driver. (The Qwen-7B critic was
    stable at 2e-5 because its layer-20 activations are far smaller than
    gpt-oss's layer-17 ~5350-norm residual stream.)
-**Result of skip-guard + lr-halving (INSUFFICIENT).** It climbed cleanly to
+**Result of non-finite-gradient skip + lr-halving (insufficient).** It reached
 peak **FVE ≈ 0.32** (step 539–570) but `pred_norm_raw` never stopped drifting
 up (6150 → 7060 → …). At **step 592 the weights NaN'd irrecoverably** — not the
 earlier intermittent skip (which the guard handles), but a permanent cascade:
 once `pred_norm`/the L17 residual stream drifted into the bf16-overflow regime,
-a *forward* overflowed → NaN weights, and the skip-guard cannot un-poison
+a *forward* overflowed → NaN weights, and the non-finite-gradient skip cannot un-poison
 weights (it only blocks new NaN-grad updates). Steps 592–967 were all NaN
 (~87 % skip in the tail). Compounding operator error: the `ckpt_janitor.sh`
 keep-1 retention (set for the *stable* actor run) pruned the finite-FVE
@@ -207,13 +207,13 @@ resulting FVE is not strictly apples-to-apples with the Qwen/Gemma/Llama
 baselines (which used λ=0); set λ=0 to recover the exact historical objective.
 Rerun also switches the janitor to keep-2 + best and adds a NaN watchdog
 (kill on sustained non-finite loss) so compute isn't wasted and a good
-checkpoint always survives. patch `0004` (skip-guard) and the
+checkpoint always survives. patch `0004` (non-finite-gradient skip) and the
 `normalize_activation` relative floor are retained as defensive depth. Memory
 `critic-nan-normalize-floor` updated.
 
 **OUTCOME — Option A was NECESSARY but NOT sufficient; it disproved the
 magnitude hypothesis (2026-06-16).** With the norm-anchor on, `pred_norm` was
-pinned to `|gold|` ~5300 *the entire run* (anchor working perfectly) — yet the
+held at `|gold|` ~5300 *the entire run* (the norm-anchor controlled magnitude as designed) — yet the
 critic still NaN'd, and **earlier, at step 87**. That ruled out the
 magnitude-runaway / forward-overflow story (the forward was stable, loss flat
 ~0.29 throughout). The `grad_norm` trace told the real story: it oscillated
@@ -226,7 +226,7 @@ the Adam moments → permanent NaN.
 
 **REAL FIX — discard the bad-gradient batches (patch 0004 extended).** Change
 the skip condition from "non-finite grad_norm" to **"non-finite OR grad_norm >
-`NLA_GRAD_SKIP_THRESHOLD` (default 1000)"** (healthy grad_norm ~4, step-0
+`NLA_GRAD_SKIP_THRESHOLD` (default 1000)"** (typical grad_norm ~4, step-0
 transient ~118, explosions 1e4+). This *discards* the garbage batches entirely
 instead of clipping+stepping them, so Adam is never poisoned. Retained the
 norm-anchor (λ=0.5, correctly stabilizes magnitude — harmless) + lr 1e-5.
@@ -264,7 +264,7 @@ option but was declined (shared-infra mutation gate); janitor keep-N suffices.
 (safer for an unstable run) but a *full* critic checkpoint is ~115 GB
 (`hf` 29 GB + DCP `model/` ~31 GB + **fp32 Adam `optimizer/` ~55 GB**), so two
 of them plus the in-flight third's transient overflowed the 500 GB volume
-(~509 GB peak). The training was healthy (FVE 0.25, climbing) — only the save
+(~509 GB peak). Training was progressing normally (FVE 0.25, climbing) — only the save
 died. **Final janitor = keep-1-full only** (delete all older iters; the newest
 is best since FVE climbs monotonically once stable), bounding peak to ~1 full +
 1 in-flight full ≈ 451 GB. Lesson: account for the fp32-optimizer DCP (≈2×
