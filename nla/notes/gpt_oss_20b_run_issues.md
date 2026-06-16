@@ -356,7 +356,7 @@ the next phase, gated on the user (memory `stop-before-rl-directive`).
 - norm-anchor term in `nla_critic_loss` (B2, Option A — necessary, insufficient)
 - `0004_skip_nonfinite_grad.patch` — extended to skip on grad_norm > threshold,
   the REAL critic fix (B2)
-- `plot_train_log` + FVE/norm curves; committed run plots `nla/notes/plots/`
+- `plot_train_log` + FVE/norm curves; committed run plots `nla/plots/`
 - janitor keep-1-full + DCP-sourced value_head repair are operational
   (`/workspace/*.sh` on the pod), not repo code — see C1/C1b
 

@@ -1,8 +1,8 @@
 # gpt-oss-20b training-run plots
 
 Training-curve PNGs rendered by `tools/plot_train_log.py` from the miles run
-logs. Companion to `../gpt_oss_20b_run_issues.md` (postmortem) and
-`../gpt_oss_20b_decisions.md` (decisions). One dir per run; each has
+logs. Companion to `../notes/gpt_oss_20b_run_issues.md` (postmortem) and
+`../notes/gpt_oss_20b_decisions.md` (decisions). One dir per run; each has
 `loss / grad_norm / lr / response_len / reward.png`, plus extras noted below.
 
 | Dir | Run | Verdict | Key plots |
@@ -27,4 +27,4 @@ logs. Companion to `../gpt_oss_20b_run_issues.md` (postmortem) and
   working) — see run-issues §B2.
 
 Regenerate any plot from a log with:
-`python tools/plot_train_log.py --log <run.log> --out nla/notes/plots/<dir> --title "<title>"`
+`python tools/plot_train_log.py --log <run.log> --out nla/plots/<dir> --title "<title>"`
