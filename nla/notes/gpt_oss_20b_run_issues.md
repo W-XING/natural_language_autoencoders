@@ -128,8 +128,26 @@ verified `input_embeds` are consumed). Cost: eager builds the full
 RL bring-up. Committed (CLAUDE.md § Debugging updated; memory
 `gpt-oss-eager-attention-bug`). The first 189-step smoke was discarded.
 
-### B2. Critic SFT diverges to NaN (norm-growth instability + non-finite-grad)
-**Symptom.** Critic-SL ran clean for steps 0–4 (loss 0.576 → 0.385, FVE
+### B2. Critic SFT diverges to NaN (gpt-oss eager bf16 backward → garbage gradients)
+
+**Summary (attempt-by-attempt).** It took eight critic-SFT attempts to reach a
+usable model — six failures across two genuine root causes (the bf16-backward
+garbage gradients; secondary magnitude drift) plus two operator-side issues
+(checkpoint-retention/disk; the hf-export value-head gather). The detailed
+diagnosis follows the table.
+
+| # | Config | Outcome |
+|---|---|---|
+| 1 | initial (lr 2e-5, no skip) | NaN at step ~6 (`grad_norm` 2.7e11 → NaN). |
+| 2 | + fp32 loss cast | NaN step 7, bit-identical → no-op (miles already `.float()`s values before the loss). |
+| 3 | + `normalize_activation` relative floor | NaN step 7, bit-identical → wrong mechanism (loss gradient ≈ 0.02, not the source). |
+| 4 | + non-finite-gradient skip, lr 2e-5 | aborted (not a NaN): `pred_norm` running away 4712 → 6320, skip rate rising. Halved LR. |
+| 5 | non-finite-gradient skip, lr 1e-5 | reached peak FVE 0.32, then permanent NaN at step 592 (magnitude drift → bf16 forward overflow). keep-1 janitor had pruned the good checkpoints → no usable model. |
+| 6 | + norm-anchor (Option A) | NaN at step 87. `pred_norm` held at ~5300 yet still NaN → disproved the magnitude theory; exposed the eager bf16 *backward* garbage gradients. |
+| 7 | + grad-norm threshold skip (`> 1000`) | training stable (FVE 0.25) but the iter-400 checkpoint save crashed on disk-quota (keep-2-full janitor overflowed the 500 GB volume; fp32 Adam optimizer DCP is the bulk). |
+| 8 | + keep-1-full janitor (rerun from 0) | **success**: full epoch, final FVE 0.360. hf-export value-head had ~0.14 % NaN (save-path gather bug) but the DCP copy was finite → repaired the export from DCP. |
+
+**Symptom.** Critic-SL ran for steps 0–4 (loss 0.576 → 0.385, FVE
 climbing), then `train/grad_norm` spiked to **2.72e11 at step 5**, went
 **NaN at step 6**, and `train/loss`/`pred_norm_raw`/`backbone_norm_raw` were
 all NaN from step 7 onward. Deterministic and bit-reproducible across reruns.
