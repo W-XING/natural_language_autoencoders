@@ -130,22 +130,37 @@ RL bring-up. Committed (CLAUDE.md § Debugging updated; memory
 
 ### B2. Critic SFT diverges to NaN (gpt-oss eager bf16 backward → garbage gradients)
 
-**Summary (attempt-by-attempt).** It took eight critic-SFT attempts to reach a
-usable model — six failures across two genuine root causes (the bf16-backward
-garbage gradients; secondary magnitude drift) plus two operator-side issues
-(checkpoint-retention/disk; the hf-export value-head gather). The detailed
-diagnosis follows the table.
+**Summary (attempt-by-attempt).** Reaching a usable critic took eight attempts.
+The training problem had two genuine root causes — (a) the gpt-oss critic's
+eager bf16 *backward* emits enormous/non-finite gradients on a fraction of
+batches, and (b) a slower magnitude drift in the prediction norm — and the last
+two failures were operational mistakes of mine, not training problems
+(checkpoint-retention overflowing the disk, and a checkpoint-export bug).
+Terms used below:
+- **prediction norm (`pred_norm`)** — the L2 norm of the critic's predicted
+  activation vector; the gold target norm is ~5300, so a healthy run keeps
+  `pred_norm` near there.
+- **gradient-norm skip** — a guard (miles patch 0004) that *discards* an
+  optimizer step when the global gradient norm is non-finite (and, from attempt
+  7 on, also when it is implausibly large, `> 1000`), rather than letting a
+  garbage gradient update the weights.
+- **norm-anchor** — an added loss term `λ·((|pred|−|gold|)/|gold|)²` that pulls
+  the prediction norm toward the gold norm, to stop root cause (b).
+- **checkpoint janitor** — `ckpt_janitor.sh`, a background loop that deletes
+  old checkpoints so they don't fill the 500 GB volume. Each critic checkpoint
+  is ~115 GB (the fp32 Adam optimizer state is most of it), so retention policy
+  matters: "keep-1" keeps only the newest, "keep-2-full" the newest two.
 
-| # | Config | Outcome |
+| # | Change from previous | What happened, and why |
 |---|---|---|
-| 1 | initial (lr 2e-5, no skip) | NaN at step ~6 (`grad_norm` 2.7e11 → NaN). |
-| 2 | + fp32 loss cast | NaN step 7, bit-identical → no-op (miles already `.float()`s values before the loss). |
-| 3 | + `normalize_activation` relative floor | NaN step 7, bit-identical → wrong mechanism (loss gradient ≈ 0.02, not the source). |
-| 4 | + non-finite-gradient skip, lr 2e-5 | aborted (not a NaN): `pred_norm` running away 4712 → 6320, skip rate rising. Halved LR. |
-| 5 | non-finite-gradient skip, lr 1e-5 | reached peak FVE 0.32, then permanent NaN at step 592 (magnitude drift → bf16 forward overflow). keep-1 janitor had pruned the good checkpoints → no usable model. |
-| 6 | + norm-anchor (Option A) | NaN at step 87. `pred_norm` held at ~5300 yet still NaN → disproved the magnitude theory; exposed the eager bf16 *backward* garbage gradients. |
-| 7 | + grad-norm threshold skip (`> 1000`) | training stable (FVE 0.25) but the iter-400 checkpoint save crashed on disk-quota (keep-2-full janitor overflowed the 500 GB volume; fp32 Adam optimizer DCP is the bulk). |
-| 8 | + keep-1-full janitor (rerun from 0) | **success**: full epoch, final FVE 0.360. hf-export value-head had ~0.14 % NaN (save-path gather bug) but the DCP copy was finite → repaired the export from DCP. |
+| 1 | initial run (lr 2e-5, no gradient-norm skip) | NaN at step ~6: the gradient norm spiked to 2.7e11 then went non-finite, and the optimizer wrote NaN into the weights. First sign of root cause (a). |
+| 2 | compute the loss in fp32 | NaN again at step 7, **bit-for-bit identical** to attempt 1 — proving the change had no effect. miles already casts the critic outputs to fp32 before the loss, so the cast was a no-op. Wrong hypothesis (it was never a loss-precision problem). |
+| 3 | raise the `normalize_activation` divide-by-zero floor | NaN again at step 7, again bit-identical. The direction-only loss's gradient is tiny (~0.02), so the `1/|pred|` term I suspected was never the source. Wrong mechanism. |
+| 4 | add the non-finite gradient-norm skip; keep lr 2e-5 | No NaN now (bad gradients are discarded), but I **aborted it deliberately**: the prediction norm was drifting up fast (4712 → 6320 over ~28 steps, root cause (b)) and an increasing share of steps were being skipped. Restarted at half the learning rate. |
+| 5 | lower the learning rate to 1e-5 | Trained well to a peak **FVE 0.32**, then NaN'd permanently at step 592: the prediction norm kept drifting (→ 7000+) until the activations overflowed bf16 in the *forward* pass — which the gradient skip can't undo. Compounding this, the keep-1 checkpoint janitor (left over from the stable actor run) had already deleted the good earlier checkpoints, so there was **no usable model** and a full rerun was needed. |
+| 6 | add the norm-anchor loss term (user "Option A") | NaN at step 87 — *earlier* than before. The norm-anchor did its job (the prediction norm stayed near 5300 the whole run), yet it still NaN'd. This **disproved root cause (b) as the trigger** and exposed root cause (a) clearly: the gradient norm was oscillating between ~0.2 and ~1e19 on alternating batches while the forward pass stayed finite — i.e. the instability is purely in the eager bf16 *backward*. The earlier non-finite-only skip wasn't enough because gradient clipping was rescaling the merely-huge (but finite) gradients down and *applying* them, slowly corrupting the optimizer state. |
+| 7 | extend the skip to also drop implausibly-large gradients (norm > 1000) | The training fix **worked** — stable, FVE climbing to 0.25, no NaN. But the *checkpoint save* at step 400 crashed with a disk-quota error: I had switched the janitor to keep-2-full for safety, and two ~115 GB checkpoints plus a third being written exceeded the 500 GB volume. A second self-inflicted disk problem, not a training one. |
+| 8 | switch the janitor to keep only the newest checkpoint; rerun from step 0 | **Success.** Full epoch, final **FVE 0.360** (≈ the Qwen baseline 0.375), no NaN, no disk crash. One last issue: the convenience HuggingFace export of the final checkpoint had ~0.14 % NaN values in the value-head readout (a bug in the export's weight-gather), but the underlying FSDP checkpoint's value-head was fully finite, so I repaired the export by copying the value-head from it. |
 
 **Symptom.** Critic-SL ran for steps 0–4 (loss 0.576 → 0.385, FVE
 climbing), then `train/grad_norm` spiked to **2.72e11 at step 5**, went
