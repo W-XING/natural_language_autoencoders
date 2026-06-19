@@ -1,0 +1,67 @@
+# DeepSeek-R1-Distill-Llama-70B full 100k-doc run, GPT-5.5 explainer. ~500k API
+# calls. Architecturally Llama-3.3-70B, so this mirrors
+# llama70b_ultrafineweb_100k.yaml for stage0/1/3, with the stage-2 block from
+# qwen3_32b_ultrafineweb_100k_gpt55.yaml: OpenAI Batch API with gpt-5.5
+# (reasoning_effort low) instead of Sonnet-batch (user directive, 2026-06-19).
+#
+# The forced <｜Assistant｜><think>\n needs NO datagen handling: miles'
+# generic/distill_qwen loss-mask puts it on the masked prompt side at SFT
+# (mask_utils.py:36-44). actor_reasoning_mode stays "default".
+#
+# Prereq: HF_TOKEN (if base is pre-downloaded, point base_model at the path);
+#         OPENAI_API_KEY + `openai` package for stage2.
+# Run:    python -m nla.datagen.run_pipeline --config configs/datagen/deepseek_r1_70b_ultrafineweb_100k_gpt55.yaml
+
+model: deepseek_r1_70b
+base_model: deepseek-ai/DeepSeek-R1-Distill-Llama-70B  # or local path if pre-downloaded
+output_dir: /tmp/nla_deepseek_r1_70b_ultrafineweb_100k_gpt55
+
+corpus:
+  name: /workspace/data/ufw_en_slice   # local slice on the pod volume (see memory)
+  config: null
+  split: train
+  text_column: content
+  start: 0
+  length: 100000
+
+stage0:
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42
+  # device_map: auto already shards the 70B model across all visible GPUs;
+  # multigpu: true would try to spawn one process per GPU on top of that and OOM.
+  # For 100k, prefer N independent 2×GPU data-parallel shards (--shard i/N) over
+  # one 8-GPU pipeline; per-doc keyed RNG makes sharding bit-reproducible.
+  multigpu: false
+  extractor_kwargs:
+    batch_size: 8
+    max_length: 4096
+    device_map: auto
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  # GPT-5.5 via OpenAI Batch API (50% off sync pricing). reasoning_effort low
+  # keeps reasoning-token output (billed as output) low. ~$2.2k for the ~500k
+  # av+ar calls (same estimate as the qwen3 gpt55 run).
+  provider_cls: nla.datagen.providers.OpenAIBatchProvider
+  provider_kwargs:
+    model: gpt-5.5
+    reasoning_effort: low  # gpt-5.5 rejects 'minimal'; 'low' = its least non-zero
+    max_completion_tokens: 2048  # reasoning(low)+output can exceed 1024 → truncation
+    batch_max_requests: 20000
+  chunk_size: 65536
+
+stage3:
+  keep_debug_metadata: true
+  actor_reasoning_mode: default
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage

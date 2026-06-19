@@ -76,6 +76,31 @@ MODELS: dict[str, ModelPreset] = {
         turn_marker="<|start_header_id|>",
         accepts_system_role=True,
     ),
+    "deepseek_r1_70b": ModelPreset(
+        # DeepSeek-R1-Distill-Llama-70B — architecturally Llama-3.3-70B
+        # (model_type "llama", 80 layers, d_model 8192, GQA 64/8), so the
+        # datagen/training path is the llama70b path. Two differences:
+        #   1. DeepSeek tokenizer — turn markers <｜User｜>/<｜Assistant｜> (NOT
+        #      Llama-3's <|start_header_id|>), DeepSeek BOS/EOS strings.
+        #   2. Always-on reasoning: the chat template force-appends
+        #      <｜Assistant｜><think>\n on add_generation_prompt and has NO
+        #      enable_thinking switch. This needs NO special handling here —
+        #      miles' generic/distill_qwen loss-mask splits at the
+        #      add_generation_prompt divergence point and puts the forced
+        #      <think>\n on the masked prompt side (mask_utils.py:36-44 names
+        #      this case explicitly). Train with --loss-mask-type generic
+        #      (or qwen, which auto-routes via the <｜Assistant｜> added token)
+        #      and actor_reasoning_mode="default" — NOT forced_final.
+        # default_layer = (2*80)//3 = 53. batch_size=1 like llama70b (the
+        # device_map="auto" + larger-batch meta-device flap, see note above);
+        # configs override to 8 for the 8×H100 stage0 run.
+        hf_name="deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+        num_layers=80,
+        d_model=8192,
+        extractor_kwargs={"batch_size": 1, "max_length": 4096, "device_map": "auto"},
+        turn_marker="<｜Assistant｜>",
+        accepts_system_role=False,  # DeepSeek: all instructions in the user turn
+    ),
     "gpt_oss_20b": ModelPreset(
         # First MoE base model: 32 experts/layer, MXFP4-packed expert MLPs
         # (attention/router/embeddings are bf16). MXFP4 kernels need Hopper+.
@@ -86,6 +111,26 @@ MODELS: dict[str, ModelPreset] = {
         d_model=2880,
         extractor_kwargs={"batch_size": 4, "max_length": 4096, "device_map": "cuda:0"},
         turn_marker="<|start|>",
+        accepts_system_role=True,
+    ),
+    "qwen3_32b": ModelPreset(
+        # Dense post-trained model (NOT the Qwen3-MoE variants). Plain bf16
+        # weights — no MXFP4, fully differentiable — and standard causal GQA
+        # (QK-Norm, RoPE base 1e6, no SWA, no attention sink), so it trains with
+        # the default attn impl (FA2/SDPA); the gpt-oss eager-only assert is
+        # gated on model_type=="gpt_oss" and does not apply.
+        # default_layer = (2*64)//3 = 42. arch_adapters is pass-through
+        # (model_type=="qwen3", embed scale 1.0). Qwen3 is thinking-capable:
+        # train with --loss-mask-type qwen3 and disable thinking at rollout
+        # (enable_thinking=False, gated on model_type in nla_generate).
+        hf_name="Qwen/Qwen3-32B",
+        num_layers=64,
+        d_model=5120,
+        # 66GB bf16 weights on one 80GB GPU leaves little headroom; start small
+        # and tune in Phase-0 calibration. No device_map — multigpu.sh pins one
+        # GPU per process via CUDA_VISIBLE_DEVICES.
+        extractor_kwargs={"batch_size": 2, "max_length": 4096},
+        turn_marker="<|im_start|>",
         accepts_system_role=True,
     ),
 }

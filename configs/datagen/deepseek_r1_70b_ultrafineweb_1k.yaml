@@ -1,0 +1,65 @@
+# DeepSeek-R1-Distill-Llama-70B 1k-doc smoke test. Measures INJ_SCALE, verifies
+# layer-53 extraction, ~5k API calls. Architecturally Llama-3.3-70B, so this
+# mirrors llama70b_ultrafineweb_1k.yaml EXCEPT:
+#   - model: deepseek_r1_70b  (DeepSeek tokenizer; forced <think> handled by the
+#     generic/distill_qwen loss-mask at SFT — no datagen change, see model_presets.py)
+#   - stage2 uses GPT-5.5 (OpenAIProvider, sync) instead of Sonnet (user directive)
+#
+# Prereq: huggingface-cli login (DeepSeek-R1 base is ungated, but stage2 needs
+#         OPENAI_API_KEY + the `openai` package).
+# Run:    python -m nla.datagen.run_pipeline --config configs/datagen/deepseek_r1_70b_ultrafineweb_1k.yaml
+
+model: deepseek_r1_70b  # → layer_index=53, d_model=8192, extractor batch_size=1, device_map=auto
+base_model: deepseek-ai/DeepSeek-R1-Distill-Llama-70B  # or local path if pre-downloaded
+output_dir: /tmp/nla_deepseek_r1_70b_ultrafineweb_1k
+
+corpus:
+  name: openbmb/Ultra-FineWeb   # see qwen7b_ultrafineweb_100k.yaml header re: dataset size
+  config: null
+  split: en
+  text_column: content
+  start: 0
+  length: 1000
+
+stage0:
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42
+  # multigpu: true conflicts with device_map=auto — stage0_multigpu.sh launches
+  # one proc/GPU (CUDA_VISIBLE_DEVICES=$i), but 70B needs multi-GPU shard.
+  # Single process with device_map=auto lets accelerate shard across all GPUs.
+  multigpu: false
+  # Preset has batch_size=1 (single-GPU-with-offload default). With 8 H100s
+  # device_map=auto shards weights to ~18GB/GPU leaving ~60GB for activations.
+  extractor_kwargs:
+    batch_size: 8
+    max_length: 4096
+    device_map: auto
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  # GPT-5.5 via OpenAI sync API for the smoke (Batch API is for the 100k run —
+  # see deepseek_r1_70b_ultrafineweb_100k_gpt55.yaml). reasoning_effort low keeps
+  # reasoning-token output (billed as output) down; gpt-5.5 rejects 'minimal'.
+  provider_cls: nla.datagen.providers.OpenAIProvider
+  provider_kwargs:
+    model: gpt-5.5
+    reasoning_effort: low
+    max_completion_tokens: 2048
+    concurrency: 20
+  chunk_size: 65536
+
+stage3:
+  keep_debug_metadata: true
+  actor_reasoning_mode: default  # NOT forced_final — generic loss-mask absorbs <think>
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage
