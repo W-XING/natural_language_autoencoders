@@ -1,0 +1,62 @@
+# Qwen3-32B 1k-doc smoke test. Measures INJ_SCALE, verifies layer-42
+# extraction, ~5k API calls (streaming provider, fast feedback).
+#
+# Qwen3-32B is a dense post-trained model, plain bf16 (no MXFP4), standard
+# causal GQA — trains with the default attn impl. It is thinking-capable:
+# training uses --loss-mask-type qwen3 and rollout disables thinking
+# (enable_thinking=False, gated on model_type in nla_generate). Hence
+# actor_reasoning_mode stays "default" (NOT forced_final — that's Harmony/gpt-oss).
+#
+# Qwen3-32B is ungated (Apache-2.0) — no HF_TOKEN required.
+# Run:    python -m nla.datagen.run_pipeline --config configs/datagen/qwen3_32b_ultrafineweb_1k.yaml
+
+model: qwen3_32b  # → d_model=5120, num_layers=64, extractor batch_size=2
+base_model: Qwen/Qwen3-32B  # or local path if pre-downloaded
+layer_index: 42  # preset default_layer = (2*64)//3 = 42. Optional: pin via a
+                 # logit-lens KL probe over K∈{40,42,44} in Phase 0.
+output_dir: /tmp/nla_qwen3_32b_ultrafineweb_1k
+
+corpus:
+  # Local single-file slice of openbmb/Ultra-FineWeb en. Keep IDENTICAL to the
+  # 100k config so per-doc keyed RNG and stage2 cache_from line up across runs.
+  name: /workspace/data/ufw_en_slice
+  config: null
+  split: train
+  text_column: content
+  start: 0
+  length: 1000
+
+stage0:
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42
+  multigpu: true
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  # Streaming provider for the smoke (~5k calls) — faster turnaround than the
+  # Batches API. The 100k run switches to AnthropicBatchProvider (50% pricing).
+  provider_cls: nla.datagen.providers.AnthropicProvider
+  provider_kwargs:
+    model: claude-sonnet-4-6
+    max_tokens: 300
+    temperature: 1.0
+    concurrency: 20
+  chunk_size: 65536
+
+stage3:
+  keep_debug_metadata: true
+  # Dense Qwen3, no Harmony channels. Thinking is disabled at rollout via
+  # enable_thinking=False (model_type-gated), not via a reasoning-mode prefill.
+  actor_reasoning_mode: default
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage

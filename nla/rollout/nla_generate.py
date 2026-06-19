@@ -59,6 +59,13 @@ _FORCED_FINAL_PREFIX: list[int] = []
 _EMBED: torch.nn.Embedding | None = None
 _EMBED_SCALE: float = 1.0
 _EMBED_MTIME: float = 0.0
+# Qwen3 is thinking-capable: at add_generation_prompt time its chat template
+# would let the actor open a live <think>…</think> trace, polluting the
+# <explanation>-only output the critic/reward parse. Gate on model_type=="qwen3"
+# so apply_chat_template gets enable_thinking=False (prefills an empty think
+# block on the prompt side → response starts at the explanation). No-op for
+# every other model (the kwarg is ignored by templates that don't reference it).
+_DISABLE_THINKING: bool = False
 _PREFILL_LEAK_PINGED = False
 
 # bf16-base64: ~12MB JSON body → ~2.8MB string. sglang casts to bf16 on
@@ -81,7 +88,7 @@ _ENGINE_URLS_LOCK = asyncio.Lock()
 
 
 def _lazy_init(args):
-    global _TOKENIZER, _CFG, _EMBED, _EMBED_SCALE, _FORCED_FINAL_PREFIX
+    global _TOKENIZER, _CFG, _EMBED, _EMBED_SCALE, _FORCED_FINAL_PREFIX, _DISABLE_THINKING
     if _TOKENIZER is not None:
         return
     _TOKENIZER = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
@@ -119,6 +126,10 @@ def _lazy_init(args):
     if _EMBED_SCALE != 1.0:
         print(f"[NLA] embed scale ×{_EMBED_SCALE:.2f} "
               f"(model_type={getattr(hf_config, 'model_type', '?')}) — applied to rollout embeds")
+    _DISABLE_THINKING = getattr(hf_config, "model_type", None) == "qwen3"
+    if _DISABLE_THINKING:
+        print("[NLA] model_type=qwen3 → enable_thinking=False on rollout prompts "
+              "(actor emits <explanation> directly, no <think> trace)")
 
 
 _LAST_EMBED_CHECK: float = 0.0
@@ -179,8 +190,11 @@ def _prep_payload_sync(args, messages, activation_vector, sampling_params, sampl
     event loop. Without this, 512 coroutines trickle to SGLang at ~30 req/s;
     batch drains to #running-req: 1 between bursts (79 tok/s avg vs 2770 peak).
     With it, all 512 dispatch fast → SGLang stays at max batch."""
+    # Qwen3: enable_thinking=False so the actor cannot open a <think> trace
+    # (see _DISABLE_THINKING). Other models: empty kwargs, template unchanged.
+    template_kwargs = {"enable_thinking": False} if _DISABLE_THINKING else {}
     prompt_str = _TOKENIZER.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True, **template_kwargs
     )
     # add_special_tokens=False is LOAD-BEARING for Gemma/Llama. The chat-template
     # string already has <bos> baked in; encode(add_special_tokens=True) would

@@ -1,0 +1,56 @@
+# Qwen3-32B 100k-doc run, GPT-5.5 explainer variant.
+#
+# Identical to qwen3_32b_ultrafineweb_100k.yaml EXCEPT stage2 uses OpenAI's
+# Batch API with gpt-5.5 (reasoning_effort=minimal) instead of Sonnet-batch.
+# Chosen by the user (2026-06-17) after the smoke comparison; ~2x Sonnet's cost
+# (GPT-5.5 $5/$30 per Mtok + reasoning billed as output, halved by the Batch
+# API). See nla/notes/qwen3_32b_execution_plan.md for the comparison.
+#
+# Run: python -m nla.datagen.run_pipeline --config configs/datagen/qwen3_32b_ultrafineweb_100k_gpt55.yaml
+
+model: qwen3_32b
+base_model: Qwen/Qwen3-32B  # or local path if pre-downloaded
+layer_index: 42
+output_dir: /tmp/nla_qwen3_32b_ultrafineweb_100k_gpt55
+
+corpus:
+  name: /workspace/data/ufw_en_slice
+  config: null
+  split: train
+  text_column: content
+  start: 0
+  length: 100000
+
+stage0:
+  positions_per_doc: 10
+  chunk_size: 256
+  seed: 42
+  multigpu: true
+
+stage1:
+  av_sft_frac: 0.25
+  ar_sft_frac: 0.25
+  rl_frac: 0.50
+  seed: 42
+
+stage2:
+  # GPT-5.5 via OpenAI Batch API (50% off sync pricing). reasoning_effort
+  # minimal keeps reasoning-token output (billed as output) low. ~$2.2k for the
+  # ~500k av+ar calls.
+  provider_cls: nla.datagen.providers.OpenAIBatchProvider
+  provider_kwargs:
+    model: gpt-5.5
+    reasoning_effort: low  # gpt-5.5 rejects 'minimal'; 'low' = its least non-zero (the comparison setting)
+    max_completion_tokens: 2048  # reasoning(low)+output can exceed 1024 → truncation; 2048 gives headroom
+    batch_max_requests: 20000
+  chunk_size: 65536
+
+stage3:
+  keep_debug_metadata: true
+  actor_reasoning_mode: default
+
+shuffle:
+  enabled: true
+  seed: 42
+
+storage_cls: nla.datagen.storage.LocalStorage

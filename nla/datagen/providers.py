@@ -11,6 +11,8 @@ Swap via `--provider-cls my.module.MyProvider` at stage2 invocation.
 """
 
 import asyncio
+import io
+import json
 import time
 from abc import ABC, abstractmethod
 
@@ -139,6 +141,97 @@ class AnthropicProvider(CompletionProvider):
         return out
 
 
+class OpenAIProvider(CompletionProvider):
+    """Stage-2 provider for OpenAI chat models — incl. the GPT-5.x reasoning
+    family — with bounded async concurrency. Mirrors AnthropicProvider's
+    contract (per-prompt None on give-up; tolerated transients degrade to None,
+    everything else raises loud).
+
+    GPT-5.x are reasoning models, so the Chat Completions call differs from a
+    classic completion: it uses `max_completion_tokens` (NOT `max_tokens`) and
+    `reasoning_effort`, and reasoning tokens are billed as output and counted
+    against the completion budget — hence the default budget is higher than the
+    Anthropic 300. `temperature` is NOT sent: the reasoning models only accept
+    the default (1.0) and reject other values.
+
+    `openai` is imported lazily so the package is only required when this
+    provider is actually selected (--provider-cls).
+    """
+
+    def __init__(
+        self,
+        model: str = "gpt-5.5",
+        max_completion_tokens: int = 2048,
+        reasoning_effort: str = "low",
+        concurrency: int = 32,
+        max_retries: int = 10,
+    ):
+        import openai
+
+        self.client = openai.AsyncOpenAI(max_retries=max_retries)
+        self.model = model
+        self.max_completion_tokens = max_completion_tokens
+        self.reasoning_effort = reasoning_effort
+        self.concurrency = concurrency
+        # Exceptions we degrade to None (drop the row) instead of killing the
+        # batch — same policy as AnthropicProvider. Set here because openai is
+        # imported lazily.
+        self._tolerated = (
+            openai.RateLimitError,
+            openai.InternalServerError,
+            openai.APIConnectionError,
+        )
+
+    async def _one(self, sem: asyncio.Semaphore, prompt: str) -> str | None:
+        async with sem:
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=self.max_completion_tokens,
+                reasoning_effort=self.reasoning_effort,
+            )
+        choice = resp.choices[0]
+        # content_filter / unexpected stop → drop the row. "length" (budget
+        # exhausted) is kept: stage2's closing-tag regex drops it if truncated,
+        # mirroring how AnthropicProvider passes max_tokens through.
+        if choice.finish_reason not in ("stop", "length"):
+            return None
+        content = (choice.message.content or "").strip()
+        if not content:
+            return None
+        return content
+
+    def complete(self, prompts: list[str]) -> list[str | None]:
+        async def _run() -> list[str | None | BaseException]:
+            sem = asyncio.Semaphore(self.concurrency)
+            return await asyncio.gather(
+                *(self._one(sem, p) for p in prompts),
+                return_exceptions=True,
+            )
+
+        raw = asyncio.run(_run())
+        out: list[str | None] = []
+        n_failed = 0
+        n_dropped = 0
+        for i, r in enumerate(raw):
+            if isinstance(r, str):
+                out.append(r)
+            elif r is None:
+                n_dropped += 1
+                out.append(None)
+            elif isinstance(r, self._tolerated):
+                n_failed += 1
+                out.append(None)
+            elif isinstance(r, BaseException):
+                # Not a transient — auth/schema/code bug. Blow up loud.
+                raise r
+            else:
+                raise AssertionError(f"gather returned unexpected type at [{i}]: {type(r).__name__}")
+        if n_failed or n_dropped:
+            print(f"  [OpenAIProvider] dropped {n_dropped} empty/filtered + {n_failed} retry-exhausted of {len(prompts)}")
+        return out
+
+
 class AnthropicBatchProvider(CompletionProvider):
     """Message Batches API provider — 50% of standard token prices.
 
@@ -260,6 +353,175 @@ class AnthropicBatchProvider(CompletionProvider):
         if n_exhausted or n_refused:
             print(
                 f"  [AnthropicBatchProvider] dropped {n_refused} refused + "
+                f"{n_exhausted} retry-exhausted of {len(prompts)}"
+            )
+        return resolved
+
+
+class OpenAIBatchProvider(CompletionProvider):
+    """Stage-2 provider using the OpenAI Batch API (50% off sync pricing) for
+    the GPT-5.x reasoning family. Mirrors AnthropicBatchProvider: one
+    `complete()` writes a JSONL request file, uploads it, creates one or more
+    batches (`batch_max_requests` each — the API caps a batch at 50k requests /
+    200MB), polls each to a terminal status, then maps results back by
+    custom_id. Transient per-request failures (non-200 / request-level errors)
+    and `expired`/`failed` batches are resubmitted up to `max_retries`;
+    still-unresolved requests return None (caller drops the row).
+
+    Reasoning tokens bill as output, so `reasoning_effort` defaults to
+    "minimal" to keep the 100k run affordable. `temperature` is not sent — the
+    reasoning models only accept the default. `openai` is imported lazily so
+    it's only required when this provider is selected.
+    """
+
+    def __init__(
+        self,
+        model: str = "gpt-5.5",
+        max_completion_tokens: int = 2048,
+        reasoning_effort: str = "low",  # gpt-5.5: none/low/medium/high/xhigh ('minimal' is rejected)
+        poll_interval_s: float = 60.0,
+        max_retries: int = 2,
+        batch_max_requests: int = 20000,
+    ):
+        import openai
+
+        self.client = openai.OpenAI()
+        self.model = model
+        self.max_completion_tokens = max_completion_tokens
+        self.reasoning_effort = reasoning_effort
+        self.poll_interval_s = poll_interval_s
+        self.max_retries = max_retries
+        self.batch_max_requests = batch_max_requests
+
+    def _submit(self, pending: dict[str, str]) -> list[str]:
+        """Submit pending {custom_id: prompt} as one or more batches; return batch ids."""
+        ids = list(pending)
+        batch_ids: list[str] = []
+        for lo in range(0, len(ids), self.batch_max_requests):
+            chunk_ids = ids[lo : lo + self.batch_max_requests]
+            lines = [
+                json.dumps(
+                    {
+                        "custom_id": cid,
+                        "method": "POST",
+                        "url": "/v1/chat/completions",
+                        "body": {
+                            "model": self.model,
+                            "messages": [{"role": "user", "content": pending[cid]}],
+                            "max_completion_tokens": self.max_completion_tokens,
+                            "reasoning_effort": self.reasoning_effort,
+                        },
+                    }
+                )
+                for cid in chunk_ids
+            ]
+            payload = ("\n".join(lines) + "\n").encode("utf-8")
+            up = self.client.files.create(
+                file=("batch_input.jsonl", io.BytesIO(payload)), purpose="batch"
+            )
+            batch = self.client.batches.create(
+                input_file_id=up.id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h",
+            )
+            print(f"  [OpenAIBatchProvider] submitted batch {batch.id} ({len(chunk_ids)} requests)")
+            batch_ids.append(batch.id)
+        return batch_ids
+
+    def _await_batch(self, batch_id: str):
+        t0 = time.monotonic()
+        terminal = ("completed", "failed", "expired", "cancelled")
+        while True:
+            batch = self.client.batches.retrieve(batch_id)
+            if batch.status in terminal:
+                rc = batch.request_counts
+                print(
+                    f"  [OpenAIBatchProvider] batch {batch_id} {batch.status} in "
+                    f"{time.monotonic() - t0:.0f}s: {rc.completed} completed, "
+                    f"{rc.failed} failed of {rc.total}"
+                )
+                return batch
+            time.sleep(self.poll_interval_s)
+
+    def _read_jsonl_file(self, file_id: str):
+        content = self.client.files.content(file_id)
+        text = content.text if hasattr(content, "text") else content.read().decode("utf-8")
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+    def complete(self, prompts: list[str]) -> list[str | None]:
+        pending = {f"p{i}": p for i, p in enumerate(prompts)}
+        resolved: list[str | None] = [None] * len(prompts)
+        n_dropped = 0
+
+        for _round in range(self.max_retries + 1):
+            if not pending:
+                break
+            batch_ids = self._submit(pending)
+            retry: dict[str, str] = {}
+            seen: set[str] = set()
+            for batch_id in batch_ids:
+                batch = self._await_batch(batch_id)
+                # Successes land in output_file_id, rejected requests in
+                # error_file_id — scan both; each line carries its custom_id.
+                for fid in (batch.output_file_id, batch.error_file_id):
+                    if not fid:
+                        continue
+                    for rec in self._read_jsonl_file(fid):
+                        cid = rec.get("custom_id")
+                        if cid is None:
+                            continue
+                        seen.add(cid)
+                        idx = int(cid[1:])
+                        resp = rec.get("response") or {}
+                        body = resp.get("body") or {}
+                        if rec.get("error") or resp.get("status_code") != 200:
+                            err = body.get("error") or {} if isinstance(body, dict) else {}
+                            msg = err.get("message") or ""
+                            if err.get("type") == "invalid_request_error":
+                                # OpenAI overloads invalid_request for BOTH per-row
+                                # content issues (safety refusal, output-length cutoff,
+                                # over-long prompt — these have param=None and no
+                                # config code) AND systematic config bugs (bad model
+                                # or parameter, which hit every row). Drop the former
+                                # (like a refusal/truncation), raise the latter loud.
+                                # Discriminator: a named `param` or a config `code`.
+                                _FATAL = {
+                                    "model_not_found", "unsupported_value",
+                                    "unsupported_parameter", "unknown_parameter",
+                                    "invalid_value",
+                                }
+                                if err.get("param") or err.get("code") in _FATAL:
+                                    raise RuntimeError(
+                                        f"OpenAI batch request {cid} rejected as "
+                                        f"invalid_request (systematic): {msg!r} "
+                                        f"(param={err.get('param')!r} code={err.get('code')!r})"
+                                    )
+                                n_dropped += 1  # per-row content refusal / length cutoff
+                                continue
+                            retry[cid] = pending[cid]  # transient — resubmit
+                            continue
+                        choice = (body.get("choices") or [{}])[0]
+                        fin = choice.get("finish_reason")
+                        content = ((choice.get("message") or {}).get("content") or "").strip()
+                        # "stop"/"length" with content → keep (stage2 regex drops
+                        # truncated-no-tag). content_filter / empty → final drop.
+                        if fin in ("stop", "length") and content:
+                            resolved[idx] = content
+                        else:
+                            n_dropped += 1
+            # Submitted this round but absent from both files → resubmit.
+            for cid in pending:
+                if cid not in seen and resolved[int(cid[1:])] is None and cid not in retry:
+                    retry[cid] = pending[cid]
+            pending = retry
+
+        n_exhausted = len(pending)
+        if n_exhausted or n_dropped:
+            print(
+                f"  [OpenAIBatchProvider] dropped {n_dropped} empty/filtered + "
                 f"{n_exhausted} retry-exhausted of {len(prompts)}"
             )
         return resolved
