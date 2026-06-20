@@ -129,6 +129,16 @@ Append to every training launch: `--use-wandb --wandb-project nla-qwen3-32b
 
 ---
 
+## Training order: CRITIC SFT FIRST (user decision, 2026-06-19)
+
+Actor SFT and critic SFT are independent (neither consumes the other's
+checkpoint; only RL needs both — `actor_sft.sh`/`critic_sft.sh`/`rl.sh`). We run
+**critic AR-SFT first**, then actor AV-SFT, because: (1) the critic's FVE is an
+early data-quality gate on the GPT-5.5 explanations; (2) it surfaces the
+critic-NaN failure mode early; (3) it needs no Phase-0 `INJ_SCALE` calibration
+(injection is actor-only), so it starts immediately after datagen; (4) the
+truncated critic (K+1=43 layers, ~22B) is a smaller/cheaper first GPU job.
+
 ## Run sequence (on the pod)
 
 0. **Datagen 1k** — `python -m nla.datagen.run_pipeline --config

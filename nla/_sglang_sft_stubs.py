@@ -35,8 +35,58 @@ _constants.GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
 _constants.GPU_MEMORY_TYPE_WEIGHTS = "weights"
 _srt.constants = _constants
 
-# ─── sglang_router.launch_router.RouterArgs ───
-# add_cli_args is called unconditionally in miles.utils.arguments.add_router_arguments
+# ─── sglang.srt.patch_torch — miles' fsdp update_weight_utils imports
+# `monkey_patch_torch_reductions` at module top level. It rewrites torch's
+# CUDA-tensor IPC reduction for zero-copy weight transfer to the sglang engine;
+# SFT never transfers weights to an engine, so a no-op is correct. (Registered
+# as its own sys.modules entry so `from sglang.srt.patch_torch import ...`
+# resolves without sglang.srt being a real package.) ───
+_patch_torch = _stub_module("sglang.srt.patch_torch")
+_patch_torch.monkey_patch_torch_reductions = lambda *a, **k: None
+_srt.patch_torch = _patch_torch
+
+
+# ─── sglang.srt.utils — MultiprocessingSerializer + the alternate patch_torch
+# location. Both are part of the engine weight-transfer path, never hit in SFT;
+# the import must resolve but the symbols only need to exist. ───
+class _Unused:
+    """Stub for engine-only classes — importing is fine, using raises loud."""
+
+    def __init__(self, *a, **k):
+        raise RuntimeError(
+            "SFT stub: engine weight-transfer class instantiated — you're in an "
+            "RL/rollout path with only SFT stubs loaded. Build the real env "
+            "(build_conda.sh)."
+        )
+
+
+_utils = _stub_module("sglang.srt.utils")
+_utils.MultiprocessingSerializer = _Unused
+_srt.utils = _utils
+_utils_patch = _stub_module("sglang.srt.utils.patch_torch")
+_utils_patch.monkey_patch_torch_reductions = lambda *a, **k: None
+_utils.patch_torch = _utils_patch
+
+# ─── sglang.srt.weight_sync.tensor_bucket.FlattenedTensorBucket ───
+_weight_sync = _stub_module("sglang.srt.weight_sync")
+_tensor_bucket = _stub_module("sglang.srt.weight_sync.tensor_bucket")
+_tensor_bucket.FlattenedTensorBucket = _Unused
+_weight_sync.tensor_bucket = _tensor_bucket
+_srt.weight_sync = _weight_sync
+
+# ─── sglang.srt.batch_invariant_ops.enable_batch_invariant_mode (lazy, RL) ───
+_biops = _stub_module("sglang.srt.batch_invariant_ops")
+_biops.enable_batch_invariant_mode = lambda *a, **k: None
+_srt.batch_invariant_ops = _biops
+
+# ─── sglang_router.launch_router.RouterArgs — miles' add_router_arguments calls
+# RouterArgs.add_cli_args unconditionally, and RolloutManager._start_router reads
+# args.sglang_router_ip / _port / _request_timeout_secs. The real package
+# registers these under miles' prefixing (so the bare --sglang-router-ip flag
+# isn't recognized); stub add_cli_args to register exactly those flags and
+# return the parser. SFT passes --sglang-router-ip <addr> so _start_router
+# returns early (no router started) — from_cli_args is then never reached, and
+# under --debug-train-only RolloutManager creates no engines. ───
 _router = _stub_module("sglang_router")
 _launch = _stub_module("sglang_router.launch_router")
 _router.launch_router = _launch
@@ -44,8 +94,11 @@ _router.launch_router = _launch
 
 class _RouterArgs:
     @staticmethod
-    def add_cli_args(parser, use_router_prefix=True, exclude_host_port=True):  # noqa: ARG004
-        pass
+    def add_cli_args(parser, *args, **kwargs):  # noqa: ARG004
+        parser.add_argument("--sglang-router-ip", type=str, default=None)
+        parser.add_argument("--sglang-router-port", type=int, default=None)
+        parser.add_argument("--sglang-router-request-timeout-secs", type=int, default=1800)
+        return parser
 
 
 _launch.RouterArgs = _RouterArgs
@@ -71,11 +124,14 @@ _sglang_utils.sglang_engine = _engine_mod
 
 
 def _add_sglang_arguments(parser):  # noqa: ARG001
-    pass
+    # miles' arg chain does `parser = add_sglang_arguments(parser)`, so this
+    # MUST return the parser (the original stub returned None → broke the chain
+    # → add_network_arguments got parser=None). No sglang CLI args in SFT.
+    return parser
 
 
 def _sglang_validate_args(args):  # noqa: ARG001
-    pass
+    return args
 
 
 _args_mod.add_sglang_arguments = _add_sglang_arguments
